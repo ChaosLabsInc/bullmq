@@ -16,8 +16,10 @@ local rcall = redis.call
 
 -- Includes
 --- @include "includes/destructureJobKey"
+--- @include "includes/getOrSetMaxEvents"
 --- @include "includes/isLocked"
 --- @include "includes/removeJobFromAnyState"
+--- @include "includes/removeJobKeys"
 --- @include "includes/removeParentDependencyKey"
 
 local function removeJob( prefix, jobId, parentKey, removeChildren)
@@ -49,21 +51,25 @@ local function removeJob( prefix, jobId, parentKey, removeChildren)
                 removeJob( childJobPrefix, childJobId, jobKey, removeChildren )
             end
         end
+
+        local failed = rcall("HGETALL", jobKey .. ":failed")
+
+        if (#failed > 0) then
+            for i = 1, #failed, 2 do
+                local childJobId = getJobIdFromKey(failed[i])
+                local childJobPrefix = getJobKeyPrefix(failed[i], childJobId)
+                removeJob( childJobPrefix, childJobId, jobKey, removeChildren )
+            end
+        end
     end
 
     local prev = removeJobFromAnyState(prefix, jobId)
 
-    rcall("DEL", jobKey, jobKey .. ":logs", jobKey .. ":dependencies", jobKey .. ":processed")
-
-    -- -- delete keys related to rate limiter
-        -- local limiterIndexTable = KEYS[10] .. ":index"
-        -- local limitedSetKey = rcall("HGET", limiterIndexTable, jobId)
-        -- if limitedSetKey then
-        --     rcall("SREM", limitedSetKey, jobId)
-        --     rcall("HDEL", limiterIndexTable, jobId)
-    -- end
-
-    rcall("XADD", prefix .. "events", "*", "event", "removed", "jobId", jobId, "prev", prev);
+    if removeJobKeys(jobKey) > 0 then
+        local maxEvents = getOrSetMaxEvents(prefix .. "meta")
+        rcall("XADD", prefix .. "events", "MAXLEN", "~", maxEvents, "*", "event", "removed",
+            "jobId", jobId, "prev", prev)
+    end
 end
 
 local prefix = KEYS[1]

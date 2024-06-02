@@ -1,6 +1,6 @@
 import { expect } from 'chai';
 import { default as IORedis } from 'ioredis';
-import { beforeEach, describe, it } from 'mocha';
+import { beforeEach, describe, it, before, after as afterAll } from 'mocha';
 import * as sinon from 'sinon';
 import { v4 } from 'uuid';
 import { rrulestr } from 'rrule';
@@ -31,20 +31,25 @@ const ONE_DAY = 24 * ONE_HOUR;
 const NoopProc = async (job: Job) => {};
 
 describe('repeat', function () {
+  const redisHost = process.env.REDIS_HOST || 'localhost';
+  const prefix = process.env.BULLMQ_TEST_PREFIX || 'bull';
   this.timeout(10000);
   let repeat: Repeat;
   let queue: Queue;
   let queueEvents: QueueEvents;
   let queueName: string;
 
-  const connection = { host: 'localhost' };
+  let connection;
+  before(async function () {
+    connection = new IORedis(redisHost, { maxRetriesPerRequest: null });
+  });
 
   beforeEach(async function () {
     this.clock = sinon.useFakeTimers();
     queueName = `test-${v4()}`;
-    queue = new Queue(queueName, { connection });
-    repeat = new Repeat(queueName, { connection });
-    queueEvents = new QueueEvents(queueName, { connection });
+    queue = new Queue(queueName, { connection, prefix });
+    repeat = new Repeat(queueName, { connection, prefix });
+    queueEvents = new QueueEvents(queueName, { connection, prefix });
     await queueEvents.waitUntilReady();
   });
 
@@ -53,7 +58,11 @@ describe('repeat', function () {
     await queue.close();
     await repeat.close();
     await queueEvents.close();
-    await removeAllQueueData(new IORedis(), queueName);
+    await removeAllQueueData(new IORedis(redisHost), queueName);
+  });
+
+  afterAll(async function () {
+    await connection.quit();
   });
 
   describe('when exponential backoff is applied', () => {
@@ -66,7 +75,7 @@ describe('repeat', function () {
         async () => {
           throw Error('error');
         },
-        { autorun: false, connection },
+        { autorun: false, connection, prefix },
       );
       const delayStub = sinon.stub(worker, 'delay').callsFake(async () => {
         console.log('delay');
@@ -78,7 +87,7 @@ describe('repeat', function () {
           this.clock.tick(delay + 10);
           delay = delay * 2;
 
-          if (job.attemptsMade === 10) {
+          if (job!.attemptsMade === 10) {
             resolve();
           }
         });
@@ -105,6 +114,23 @@ describe('repeat', function () {
     });
   });
 
+  describe('when endDate is not greater than current timestamp', () => {
+    it('throws an error', async function () {
+      await expect(
+        queue.add(
+          'test',
+          { foo: 'bar' },
+          {
+            repeat: {
+              endDate: Date.now() - 1000,
+              every: 100,
+            },
+          },
+        ),
+      ).to.be.rejectedWith('End date must be greater than current timestamp');
+    });
+  });
+
   it('it should stop repeating after endDate', async function () {
     const every = 100;
     const date = new Date('2017-02-07 9:24:00');
@@ -114,7 +140,7 @@ describe('repeat', function () {
       async () => {
         this.clock.tick(every);
       },
-      { autorun: false, connection },
+      { autorun: false, connection, prefix },
     );
     const delayStub = sinon.stub(worker, 'delay').callsFake(async () => {});
     await worker.waitUntilReady();
@@ -259,7 +285,7 @@ describe('repeat', function () {
       async () => {
         this.clock.tick(nextTick);
       },
-      { autorun: false, connection },
+      { autorun: false, connection, prefix },
     );
     const delayStub = sinon.stub(worker, 'delay').callsFake(async () => {});
 
@@ -311,7 +337,7 @@ describe('repeat', function () {
       async () => {
         this.clock.tick(nextTick);
       },
-      { autorun: false, connection },
+      { autorun: false, connection, prefix },
     );
     const delayStub = sinon.stub(worker, 'delay').callsFake(async () => {});
 
@@ -366,7 +392,7 @@ describe('repeat', function () {
       async () => {
         this.clock.tick(nextTick);
       },
-      { autorun: false, connection },
+      { autorun: false, connection, prefix },
     );
     const delayStub = sinon.stub(worker, 'delay').callsFake(async () => {});
 
@@ -412,6 +438,7 @@ describe('repeat', function () {
     const queueName2 = `test-${v4()}`;
     const queue2 = new Queue(queueName2, {
       connection,
+      prefix,
       defaultJobOptions: {
         removeOnComplete: true,
       },
@@ -427,7 +454,7 @@ describe('repeat', function () {
       async () => {
         this.clock.tick(nextTick);
       },
-      { autorun: false, connection },
+      { autorun: false, connection, prefix },
     );
     const delayStub = sinon.stub(worker, 'delay').callsFake(async () => {});
 
@@ -469,7 +496,7 @@ describe('repeat', function () {
 
     await queue2.close();
     await worker.close();
-    await removeAllQueueData(new IORedis(), queueName2);
+    await removeAllQueueData(new IORedis(redisHost), queueName2);
     delayStub.restore();
   });
 
@@ -491,7 +518,11 @@ describe('repeat', function () {
           return next_occurrence?.getTime();
         },
       };
-      const currentQueue = new Queue(queueName, { connection, settings });
+      const currentQueue = new Queue(queueName, {
+        connection,
+        prefix,
+        settings,
+      });
 
       const nextTick = 2 * ONE_SECOND + 100;
 
@@ -500,7 +531,7 @@ describe('repeat', function () {
         async () => {
           this.clock.tick(nextTick);
         },
-        { connection, settings },
+        { connection, prefix, settings },
       );
       const delayStub = sinon.stub(worker, 'delay').callsFake(async () => {});
 
@@ -566,7 +597,11 @@ describe('repeat', function () {
             }
           },
         };
-        const currentQueue = new Queue(queueName, { connection, settings });
+        const currentQueue = new Queue(queueName, {
+          connection,
+          prefix,
+          settings,
+        });
 
         const nextTick = 2 * ONE_SECOND + 100;
 
@@ -575,12 +610,12 @@ describe('repeat', function () {
           async job => {
             this.clock.tick(nextTick);
 
-            if (job.opts.repeat.count == 5) {
+            if (job.opts.repeat!.count == 5) {
               const removed = await queue.removeRepeatable('rrule', repeat);
               expect(removed).to.be.true;
             }
           },
-          { connection, settings },
+          { connection, prefix, settings },
         );
         const delayStub = sinon.stub(worker, 'delay').callsFake(async () => {});
 
@@ -671,9 +706,13 @@ describe('repeat', function () {
     const settings = {
       repeatKeyHashAlgorithm: 'sha256',
     };
-    const currentQueue = new Queue(queueName, { connection, settings });
+    const currentQueue = new Queue(queueName, { connection, prefix, settings });
 
-    const worker = new Worker(queueName, null, { connection, settings });
+    const worker = new Worker(queueName, null, {
+      connection,
+      prefix,
+      settings,
+    });
     const delayStub = sinon.stub(worker, 'delay').callsFake(async () => {});
     const jobName = 'jobName';
     const jobId = 'jobId';
@@ -692,8 +731,8 @@ describe('repeat', function () {
       },
     );
 
-    const keyPrefix = getRepeatableJobKeyPrefix(queueName);
-    const jobsRedisKeys = await new IORedis().keys(`${keyPrefix}*`);
+    const keyPrefix = getRepeatableJobKeyPrefix(prefix, queueName);
+    const jobsRedisKeys = await new IORedis(redisHost).keys(`${keyPrefix}*`);
     expect(jobsRedisKeys.length).to.be.equal(1);
 
     const actualHashedRepeatableJobKey =
@@ -731,7 +770,7 @@ describe('repeat', function () {
       async () => {
         this.clock.tick(nextTick);
       },
-      { connection },
+      { connection, prefix },
     );
     const delayStub = sinon.stub(worker, 'delay').callsFake(async () => {});
 
@@ -790,6 +829,7 @@ describe('repeat', function () {
       {
         autorun: false,
         connection,
+        prefix,
         skipStalledCheck: true,
         skipLockRenewal: true,
       },
@@ -855,6 +895,7 @@ describe('repeat', function () {
       {
         autorun: false,
         connection,
+        prefix,
         skipStalledCheck: true,
         skipLockRenewal: true,
       },
@@ -919,7 +960,7 @@ describe('repeat', function () {
         async () => {
           this.clock.tick(nextTick);
         },
-        { autorun: false, connection },
+        { autorun: false, connection, prefix },
       );
       const delayStub = sinon.stub(worker, 'delay').callsFake(async () => {
         console.log('delay');
@@ -985,7 +1026,7 @@ describe('repeat', function () {
       async () => {
         nextTick();
       },
-      { autorun: false, connection },
+      { autorun: false, connection, prefix },
     );
     const delayStub = sinon.stub(worker, 'delay').callsFake(async () => {});
 
@@ -1053,6 +1094,47 @@ describe('repeat', function () {
     });
   });
 
+  describe('when repeatable job is promoted', function () {
+    it('keeps one repeatable and one delayed after being processed', async function () {
+      const options = {
+        repeat: {
+          pattern: '0 * 1 * *',
+        },
+      };
+
+      const worker = new Worker(queueName, async () => {}, {
+        connection,
+        prefix,
+      });
+
+      const completing = new Promise<void>(resolve => {
+        worker.on('completed', () => {
+          resolve();
+        });
+      });
+
+      const repeatableJob = await queue.add('test', { foo: 'bar' }, options);
+      const delayedCount = await queue.getDelayedCount();
+      expect(delayedCount).to.be.equal(1);
+
+      await repeatableJob.promote();
+      await completing;
+
+      const delayedCount2 = await queue.getDelayedCount();
+      expect(delayedCount2).to.be.equal(1);
+
+      const configs = await repeat.getRepeatableJobs(0, -1, true);
+
+      expect(delayedCount).to.be.equal(1);
+
+      const count = await queue.count();
+
+      expect(count).to.be.equal(1);
+      expect(configs).to.have.length(1);
+      await worker.close();
+    });
+  });
+
   it('should allow removing a named repeatable job', async function () {
     const numJobs = 3;
     const date = new Date('2017-02-07 9:24:00');
@@ -1081,7 +1163,7 @@ describe('repeat', function () {
       };
     });
 
-    const worker = new Worker(queueName, processor, { connection });
+    const worker = new Worker(queueName, processor, { connection, prefix });
     const delayStub = sinon.stub(worker, 'delay').callsFake(async () => {});
 
     await queue.add('remove', { foo: 'bar' }, { repeat });
@@ -1113,7 +1195,7 @@ describe('repeat', function () {
     const removed = await queue.removeRepeatableByKey(createdJob.repeatJobKey);
     const delayedCount = await queue.getJobCountByTypes('delayed');
     expect(delayedCount).to.be.equal(0);
-    expect(job.repeatJobKey).to.not.be.undefined;
+    expect(job!.repeatJobKey).to.not.be.undefined;
     expect(removed).to.be.true;
     const repeatableJobsAfterRemove = await queue.getRepeatableJobs();
     expect(repeatableJobsAfterRemove).to.have.length(0);
@@ -1169,7 +1251,7 @@ describe('repeat', function () {
       };
     });
 
-    const worker = new Worker(queueName, processor, { connection });
+    const worker = new Worker(queueName, processor, { connection, prefix });
     const delayStub = sinon.stub(worker, 'delay').callsFake(async () => {});
     await worker.waitUntilReady();
 
@@ -1183,7 +1265,63 @@ describe('repeat', function () {
     });
 
     await processing;
+    await worker.close();
     delayStub.restore();
+  });
+
+  describe('when custom key is provided', function () {
+    it('should allow removing a repeatable job by custom key', async function () {
+      const numJobs = 4;
+      const date = new Date('2017-02-07 9:24:00');
+      let prev: Job;
+      let counter = 0;
+      let processor;
+      const key = 'xxxx';
+
+      this.clock.setSystemTime(date);
+
+      const nextTick = 2 * ONE_SECOND + 10;
+      const repeat = { pattern: '*/2 * * * * *', key };
+
+      await queue.add('test', { foo: 'bar' }, { repeat });
+
+      this.clock.tick(nextTick);
+
+      const processing = new Promise<void>((resolve, reject) => {
+        processor = async () => {
+          counter++;
+          if (counter == numJobs) {
+            try {
+              await queue.removeRepeatable('test', repeat);
+              this.clock.tick(nextTick);
+              const delayed = await queue.getDelayed();
+              expect(delayed).to.be.empty;
+              resolve();
+            } catch (err) {
+              reject(err);
+            }
+          } else if (counter > numJobs) {
+            reject(Error(`should not repeat more than ${numJobs} times`));
+          }
+        };
+      });
+
+      const worker = new Worker(queueName, processor, { connection, prefix });
+      const delayStub = sinon.stub(worker, 'delay').callsFake(async () => {});
+      await worker.waitUntilReady();
+
+      worker.on('completed', job => {
+        this.clock.tick(nextTick);
+        if (prev) {
+          expect(prev.timestamp).to.be.lt(job.timestamp);
+          expect(job.timestamp - prev.timestamp).to.be.gte(2000);
+        }
+        prev = job;
+      });
+
+      await processing;
+      delayStub.restore();
+    });
   });
 
   // This test is flaky and too complex we need something simpler that tests the same thing
@@ -1217,7 +1355,7 @@ describe('repeat', function () {
             return result;
           };
         },
-        { connection },
+        { connection, prefix },
       );
 
       worker.on('completed', () => {
@@ -1235,7 +1373,7 @@ describe('repeat', function () {
     // Repeatable job was recreated
     expect(jobs.length).to.eql(0);
 
-    await worker.close();
+    await worker!.close();
   });
 
   it('should allow adding a repeatable job after removing it', async function () {
@@ -1243,7 +1381,7 @@ describe('repeat', function () {
       pattern: '*/5 * * * *',
     };
 
-    const worker = new Worker(queueName, NoopProc, { connection });
+    const worker = new Worker(queueName, NoopProc, { connection, prefix });
     await worker.waitUntilReady();
     const delayStub = sinon.stub(worker, 'delay').callsFake(async () => {});
 
@@ -1253,7 +1391,7 @@ describe('repeat', function () {
         data: '2',
       },
       {
-        repeat: repeat,
+        repeat,
       },
     );
     let delayed = await queue.getDelayed();
@@ -1277,16 +1415,17 @@ describe('repeat', function () {
     delayed = await queue.getDelayed();
     expect(delayed.length).to.be.eql(1);
 
-    await worker.close();
+    // We need to force close in this case, as closing is too slow in Dragonfly.
+    await worker.close(true);
     delayStub.restore();
-  });
+  }).timeout(8000);
 
   it('should not repeat more than 5 times', async function () {
     const date = new Date('2017-02-07 9:24:00');
     this.clock.setSystemTime(date);
     const nextTick = ONE_SECOND + 500;
 
-    const worker = new Worker(queueName, NoopProc, { connection });
+    const worker = new Worker(queueName, NoopProc, { connection, prefix });
     const delayStub = sinon.stub(worker, 'delay').callsFake(async () => {});
 
     await queue.add(
@@ -1345,7 +1484,7 @@ describe('repeat', function () {
 
     this.clock.tick(nextTick * 3 + 100);
 
-    const worker = new Worker(queueName, processor, { connection });
+    const worker = new Worker(queueName, processor, { connection, prefix });
     await worker.waitUntilReady();
 
     await processing;
@@ -1365,7 +1504,10 @@ describe('repeat', function () {
     await queue.add('repeat s', { type: 's' }, { repeat: { every: interval } });
     this.clock.tick(nextTick);
 
-    const worker = new Worker(queueName, async () => {}, { connection });
+    const worker = new Worker(queueName, async () => {}, {
+      connection,
+      prefix,
+    });
     const delayStub = sinon.stub(worker, 'delay').callsFake(async () => {});
     await worker.waitUntilReady();
 
@@ -1408,7 +1550,10 @@ describe('repeat', function () {
     this.clock.setSystemTime(date);
     const nextTick = 1 * ONE_SECOND + 500;
 
-    const worker = new Worker(queueName, async job => {}, { connection });
+    const worker = new Worker(queueName, async job => {}, {
+      connection,
+      prefix,
+    });
     const delayStub = sinon.stub(worker, 'delay').callsFake(async () => {});
 
     const waiting = new Promise<void>((resolve, reject) => {
@@ -1445,7 +1590,7 @@ describe('repeat', function () {
     let processor;
     const processing = new Promise<void>((resolve, reject) => {
       processor = async (job: Job) => {
-        if (job.opts.repeat.count === 1) {
+        if (job.opts.repeat!.count === 1) {
           resolve();
         } else {
           reject(new Error('repeatable job got the wrong repeat count'));
@@ -1453,7 +1598,7 @@ describe('repeat', function () {
       };
     });
 
-    const worker = new Worker(queueName, processor, { connection });
+    const worker = new Worker(queueName, processor, { connection, prefix });
 
     await processing;
     await worker.close();

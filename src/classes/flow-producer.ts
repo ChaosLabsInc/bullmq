@@ -1,5 +1,4 @@
 import { EventEmitter } from 'events';
-import { get } from 'lodash';
 import { Redis, ChainableCommander } from 'ioredis';
 import { v4 } from 'uuid';
 import {
@@ -10,7 +9,7 @@ import {
   QueueBaseOptions,
   RedisClient,
 } from '../interfaces';
-import { getParentKey } from '../utils';
+import { getParentKey, isRedisInstance } from '../utils';
 import { Job } from './job';
 import { KeysMap, QueueKeys } from './queue-keys';
 import { RedisConnection } from './redis-connection';
@@ -92,13 +91,13 @@ export interface FlowProducerListener extends IoredisListener {
 export class FlowProducer extends EventEmitter {
   toKey: (name: string, type: string) => string;
   keys: KeysMap;
-  closing: Promise<void>;
+  closing: Promise<void> | undefined;
   queueKeys: QueueKeys;
 
   protected connection: RedisConnection;
 
   constructor(
-    public opts: QueueBaseOptions = {},
+    public opts: QueueBaseOptions = { connection: {} },
     Connection: typeof RedisConnection = RedisConnection,
   ) {
     super();
@@ -108,9 +107,19 @@ export class FlowProducer extends EventEmitter {
       ...opts,
     };
 
-    this.connection = new Connection(opts.connection);
-    this.connection.on('error', error => this.emit('error', error));
-    this.connection.on('close', this.emit.bind(this, 'ioredis:close'));
+    this.connection = new Connection(
+      opts.connection,
+      isRedisInstance(opts.connection),
+      false,
+      opts.skipVersionCheck,
+    );
+
+    this.connection.on('error', (error: Error) => this.emit('error', error));
+    this.connection.on('close', () => {
+      if (!this.closing) {
+        this.emit('ioredis:close');
+      }
+    });
 
     this.queueKeys = new QueueKeys(opts.prefix);
   }
@@ -144,6 +153,24 @@ export class FlowProducer extends EventEmitter {
   ): this {
     super.once(event, listener);
     return this;
+  }
+
+  /**
+   * Returns a promise that resolves to a redis client. Normally used only by subclasses.
+   */
+  get client(): Promise<RedisClient> {
+    return this.connection.client;
+  }
+
+  /**
+   * Helper to easily extend Job class calls.
+   */
+  protected get Job(): typeof Job {
+    return Job;
+  }
+
+  waitUntilReady(): Promise<RedisClient> {
+    return this.client;
   }
 
   /**
@@ -207,17 +234,6 @@ export class FlowProducer extends EventEmitter {
     return jobsTree;
   }
 
-  get client(): Promise<RedisClient> {
-    return this.connection.client;
-  }
-
-  /**
-   * Helper to easily extend Job class calls.
-   */
-  protected get Job(): typeof Job {
-    return Job;
-  }
-
   /**
    * Adds multiple flows.
    *
@@ -262,7 +278,7 @@ export class FlowProducer extends EventEmitter {
     const queue = this.queueFromNode(node, new QueueKeys(prefix), prefix);
     const queueOpts = queuesOpts && queuesOpts[node.queueName];
 
-    const jobsOpts = get(queueOpts, 'defaultJobOptions');
+    const jobsOpts = queueOpts?.defaultJobOptions ?? {};
     const jobId = node.opts?.jobId || v4();
 
     const job = new this.Job(
@@ -270,7 +286,7 @@ export class FlowProducer extends EventEmitter {
       node.name,
       node.data,
       {
-        ...(jobsOpts ? jobsOpts : {}),
+        ...jobsOpts,
         ...node.opts,
         parent: parent?.parentOpts,
       },
@@ -305,7 +321,7 @@ export class FlowProducer extends EventEmitter {
         parent: {
           parentOpts: {
             id: parentId,
-            queue: queueKeysParent.getPrefixedQueueName(node.queueName),
+            queue: queueKeysParent.getQueueQualifiedName(node.queueName),
           },
           parentDependenciesKey,
         },
@@ -432,7 +448,8 @@ export class FlowProducer extends EventEmitter {
       name: node.queueName,
       keys: queueKeys.getKeys(node.queueName),
       toKey: (type: string) => queueKeys.toKey(node.queueName, type),
-      opts: { prefix },
+      opts: { prefix, connection: {} },
+      qualifiedName: queueKeys.getQueueQualifiedName(node.queueName),
       closing: this.closing,
       waitUntilReady: async () => this.connection.client,
       removeListener: this.removeListener.bind(this) as any,
@@ -442,13 +459,21 @@ export class FlowProducer extends EventEmitter {
     };
   }
 
-  close(): Promise<void> {
+  /**
+   *
+   * Closes the connection and returns a promise that resolves when the connection is closed.
+   */
+  async close(): Promise<void> {
     if (!this.closing) {
       this.closing = this.connection.close();
     }
-    return this.closing;
+    await this.closing;
   }
 
+  /**
+   *
+   * Force disconnects a connection.
+   */
   disconnect(): Promise<void> {
     return this.connection.disconnect();
   }

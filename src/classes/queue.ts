@@ -1,14 +1,13 @@
-import { get } from 'lodash';
 import { v4 } from 'uuid';
 import {
   BaseJobOptions,
   BulkJobOptions,
   IoredisListener,
   QueueOptions,
+  RepeatableJob,
   RepeatOptions,
 } from '../interfaces';
 import { FinishedStatus, JobsOptions, MinimalQueue } from '../types';
-import { isRedisInstance } from '../utils';
 import { Job } from './job';
 import { QueueGetters } from './queue-getters';
 import { Repeat } from './repeat';
@@ -85,7 +84,7 @@ export interface QueueListener<DataType, ResultType, NameType extends string>
 /**
  * Queue
  *
- * This class provides methods to add jobs to a queue and some othe high-level
+ * This class provides methods to add jobs to a queue and some other high-level
  * administration such as pausing or deleting queues.
  *
  */
@@ -96,6 +95,7 @@ export class Queue<
 > extends QueueGetters<DataType, ResultType, NameType> {
   token = v4();
   jobsOpts: BaseJobOptions;
+  opts: QueueOptions;
   private _repeat?: Repeat;
 
   constructor(
@@ -106,23 +106,18 @@ export class Queue<
     super(
       name,
       {
-        sharedConnection: isRedisInstance(opts?.connection),
         blockingConnection: false,
         ...opts,
       },
       Connection,
     );
 
-    this.jobsOpts = get(opts, 'defaultJobOptions') ?? {};
+    this.jobsOpts = opts?.defaultJobOptions ?? {};
 
     this.waitUntilReady()
       .then(client => {
         if (!this.closing) {
-          client.hset(
-            this.keys.meta,
-            'opts.maxLenEvents',
-            get(opts, 'streams.events.maxLen', 10000),
-          );
+          client.hmset(this.keys.meta, this.metaValues);
         }
       })
       .catch(err => {
@@ -169,6 +164,12 @@ export class Queue<
     return { ...this.jobsOpts };
   }
 
+  get metaValues(): Record<string, string | number> {
+    return {
+      'opts.maxLenEvents': this.opts?.streams?.events?.maxLen ?? 10000,
+    };
+  }
+
   get repeat(): Promise<Repeat> {
     return new Promise<Repeat>(async resolve => {
       if (!this._repeat) {
@@ -185,7 +186,7 @@ export class Queue<
   /**
    * Adds a new job to the queue.
    *
-   * @param name - Name of the job to be added to the queue,.
+   * @param name - Name of the job to be added to the queue.
    * @param data - Arbitrary data to append to the job.
    * @param opts - Job options that affects how the job is going to be processed.
    */
@@ -195,6 +196,12 @@ export class Queue<
     opts?: JobsOptions,
   ): Promise<Job<DataType, ResultType, NameType>> {
     if (opts && opts.repeat) {
+      if (opts.repeat.endDate) {
+        if (+new Date(opts.repeat.endDate) < Date.now()) {
+          throw new Error('End date must be greater than current timestamp');
+        }
+      }
+
       return (await this.repeat).addNextRepeatableJob<
         DataType,
         ResultType,
@@ -302,7 +309,11 @@ export class Queue<
    * @param asc - Determine the order in which jobs are returned based on their
    * next execution time.
    */
-  async getRepeatableJobs(start?: number, end?: number, asc?: boolean) {
+  async getRepeatableJobs(
+    start?: number,
+    end?: number,
+    asc?: boolean,
+  ): Promise<RepeatableJob[]> {
     return (await this.repeat).getRepeatableJobs(start, end, asc);
   }
 
@@ -314,7 +325,7 @@ export class Queue<
    *
    * @see removeRepeatableByKey
    *
-   * @param name -
+   * @param name - Job name
    * @param repeatOpts -
    * @param jobId -
    * @returns
@@ -337,7 +348,7 @@ export class Queue<
    *
    * @see getRepeatableJobs
    *
-   * @param key - to the repeatable job.
+   * @param repeatJobKey - To the repeatable job.
    * @returns
    */
   async removeRepeatableByKey(key: string): Promise<boolean> {
@@ -358,6 +369,36 @@ export class Queue<
    */
   remove(jobId: string, { removeChildren = true } = {}): Promise<number> {
     return this.scripts.remove(jobId, removeChildren);
+  }
+
+  /**
+   * Updates the given job's progress.
+   *
+   * @param jobId - The id of the job to update
+   * @param progress - Number or object to be saved as progress.
+   */
+  async updateJobProgress(
+    jobId: string,
+    progress: number | object,
+  ): Promise<void> {
+    return this.scripts.updateProgress(jobId, progress);
+  }
+
+  /**
+   * Logs one row of job's log data.
+   *
+   * @param jobId - The job id to log against.
+   * @param logRow - String with log data to be logged.
+   * @param keepLogs - Max number of log entries to keep (0 for unlimited).
+   *
+   * @returns The total number of log entries for this job so far.
+   */
+  async addJobLog(
+    jobId: string,
+    logRow: string,
+    keepLogs?: number,
+  ): Promise<number> {
+    return Job.addJobLog(this, jobId, logRow, keepLogs);
   }
 
   /**
@@ -393,14 +434,28 @@ export class Queue<
       | 'delayed'
       | 'failed' = 'completed',
   ): Promise<string[]> {
-    const jobs = await this.scripts.cleanJobsInSet(
-      type,
-      Date.now() - grace,
-      limit,
-    );
+    const maxCount = limit || Infinity;
+    const maxCountPerCall = Math.min(10000, maxCount);
+    const timestamp = Date.now() - grace;
+    let deletedCount = 0;
+    const deletedJobsIds: string[] = [];
 
-    this.emit('cleaned', jobs, type);
-    return jobs;
+    while (deletedCount < maxCount) {
+      const jobsIds = await this.scripts.cleanJobsInSet(
+        type,
+        timestamp,
+        maxCountPerCall,
+      );
+
+      this.emit('cleaned', jobsIds, type);
+      deletedCount += jobsIds.length;
+      deletedJobsIds.push(...jobsIds);
+
+      if (jobsIds.length < maxCountPerCall) {
+        break;
+      }
+    }
+    return deletedJobsIds;
   }
 
   /**
@@ -428,7 +483,7 @@ export class Queue<
   }
 
   /**
-   * Retry all the failed jobs.
+   * Retry all the failed or completed jobs.
    *
    * @param opts: { count: number; state: FinishedStatus; timestamp: number}
    *   - count  number to limit how many jobs will be moved to wait status per iteration,
