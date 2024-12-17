@@ -37,6 +37,70 @@ describe('connection', () => {
     await connection.quit();
   });
 
+  describe('establish ioredis connection', () => {
+    it('should connect with host:port', async () => {
+      const queue = new Queue('valid-host-port', {
+        connection: {
+          host: 'localhost',
+          port: 6379,
+          retryStrategy: () => null,
+        },
+      });
+
+      const client = await queue.waitUntilReady();
+      expect(client.status).to.be.eql('ready');
+
+      await queue.close();
+    });
+
+    it('should fail with invalid host:port', async () => {
+      const queue = new Queue('invalid-host-port', {
+        connection: {
+          host: 'localhost',
+          port: 9000,
+          retryStrategy: () => null,
+        },
+      });
+
+      await expect(queue.waitUntilReady()).to.be.eventually.rejectedWith(
+        'connect ECONNREFUSED 127.0.0.1:9000',
+      );
+    });
+
+    it('should connect with connection URL', async () => {
+      const queue = new Queue('valid-url', {
+        connection: {
+          url: 'redis://localhost:6379',
+          // Make sure defaults are not being used
+          host: '1.1.1.1',
+          port: 2222,
+          retryStrategy: () => null,
+        },
+      });
+
+      const client = await queue.waitUntilReady();
+      expect(client.status).to.be.eql('ready');
+
+      await queue.close();
+    });
+
+    it('should fail with invalid connection URL', async () => {
+      const queue = new Queue('invalid-url', {
+        connection: {
+          url: 'redis://localhost:9001',
+          // Make sure defaults are not being used
+          host: '1.1.1.1',
+          port: 2222,
+          retryStrategy: () => null,
+        },
+      });
+
+      await expect(queue.waitUntilReady()).to.be.eventually.rejectedWith(
+        'connect ECONNREFUSED 127.0.0.1:9001',
+      );
+    });
+  });
+
   describe('prefix', () => {
     it('should throw exception if using prefix with ioredis', async () => {
       const connection = new IORedis({
@@ -85,11 +149,10 @@ describe('connection', () => {
 
   describe('non-blocking', () => {
     it('should not override any redis options', async () => {
-      connection = new IORedis(redisHost, { maxRetriesPerRequest: 20 });
+      const connection2 = new IORedis(redisHost, { maxRetriesPerRequest: 20 });
 
-      const queue = new QueueBase(queueName, {
-        connection,
-        blockingConnection: false,
+      const queue = new Queue(queueName, {
+        connection: connection2,
       });
 
       const options = <RedisOptions>(await queue.client).options;
@@ -97,6 +160,7 @@ describe('connection', () => {
       expect(options.maxRetriesPerRequest).to.be.equal(20);
 
       await queue.close();
+      await connection2.quit();
     });
   });
 

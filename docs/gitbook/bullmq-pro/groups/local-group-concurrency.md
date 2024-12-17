@@ -14,8 +14,17 @@ const groupId = 'my group';
 await queue.setGroupConcurrency(groupId, 4);
 ```
 
+{% hint style="warning" %}
+Make sure to also set the [Group Concurrency](concurrency.md) at the worker instance level along side with the desired local concurrency, as it is required for this feature to function properly and also will act as a default concurrency value for the groups that have no local concurrency defined.
+{% endhint %}
+
 And you can use the `getGroupConcurrency` method like this:
 
 ```typescript
 const concurrency = await queue.getGroupConcurrency(groupId);
 ```
+
+## Read more:
+
+- 💡 [Set Group Concurrency API Reference](https://api.bullmq.pro/classes/v7.Queue.html#setGroupConcurrency)
+- 💡 [Get Group Concurrency API Reference](https://api.bullmq.pro/classes/v7.Queue.html#getGroupConcurrency)

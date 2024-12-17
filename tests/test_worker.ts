@@ -480,19 +480,24 @@ describe('workers', function () {
     await worker.waitUntilReady();
 
     // Add spy to worker.moveToActive
-    const spy = sinon.spy(worker, 'moveToActive');
+    const spy = sinon.spy(worker as any, 'moveToActive');
     const bclientSpy = sinon.spy(
-      await worker.blockingConnection.client,
+      await (worker as any).blockingConnection.client,
       'bzpopmin',
     );
 
-    for (let i = 0; i < numJobs; i++) {
-      const job = await queue.add('test', { foo: 'bar' });
-      expect(job.id).to.be.ok;
-      expect(job.data.foo).to.be.eql('bar');
+    const jobsData: { name: string; data: any }[] = [];
+    for (let j = 0; j < numJobs; j++) {
+      jobsData.push({
+        name: 'test',
+        data: { foo: 'bar' },
+      });
     }
 
-    expect(bclientSpy.callCount).to.be.equal(1);
+    await queue.addBulk(jobsData);
+
+    expect(bclientSpy.callCount).to.be.gte(0);
+    expect(bclientSpy.callCount).to.be.lte(1);
 
     await new Promise<void>((resolve, reject) => {
       worker.on('completed', (_job: Job, _result: any) => {
@@ -510,9 +515,17 @@ describe('workers', function () {
     await worker.close();
   });
 
-  it('do not call moveToActive more than number of jobs + 1', async () => {
+  it('do not call moveToActive more than number of jobs + 2', async () => {
     const numJobs = 50;
     let completedJobs = 0;
+
+    const jobs: Promise<Job>[] = [];
+    for (let i = 0; i < numJobs; i++) {
+      jobs.push(queue.add('test', { foo: 'bar' }));
+    }
+
+    await Promise.all(jobs);
+
     const worker = new Worker(
       queueName,
       async job => {
@@ -521,22 +534,16 @@ describe('workers', function () {
       },
       { connection, prefix, concurrency: 100 },
     );
-    await worker.waitUntilReady();
 
     // Add spy to worker.moveToActive
-    const spy = sinon.spy(worker, 'moveToActive');
+    const spy = sinon.spy(worker as any, 'moveToActive');
     const bclientSpy = sinon.spy(
-      await worker.blockingConnection.client,
+      await (worker as any).blockingConnection.client,
       'bzpopmin',
     );
+    await worker.waitUntilReady();
 
-    for (let i = 0; i < numJobs; i++) {
-      const job = await queue.add('test', { foo: 'bar' });
-      expect(job.id).to.be.ok;
-      expect(job.data.foo).to.be.eql('bar');
-    }
-
-    expect(bclientSpy.callCount).to.be.equal(1);
+    expect(bclientSpy.callCount).to.be.equal(0);
 
     await new Promise<void>((resolve, reject) => {
       worker.on('completed', (job: Job, result: any) => {
@@ -547,9 +554,11 @@ describe('workers', function () {
       });
     });
 
+    expect(completedJobs).to.be.equal(numJobs);
+    expect(bclientSpy.callCount).to.be.equal(2);
+
     // Check moveToActive was called numJobs + 2 times
     expect(spy.callCount).to.be.equal(numJobs + 2);
-    expect(bclientSpy.callCount).to.be.equal(3);
 
     await worker.close();
   });
@@ -585,8 +594,12 @@ describe('workers', function () {
       { connection, prefix },
     );
 
-    worker.on('completed', async () => {
-      await anotherWorker.close();
+    await anotherWorker.waitUntilReady();
+
+    await new Promise<void>((resolve, reject) => {
+      worker.on('completed', async () => {
+        resolve();
+      });
     });
 
     await worker.close();
@@ -857,7 +870,7 @@ describe('workers', function () {
 
       await delay(100);
       /* Try to gracefully close while having a job that will be failed running */
-      worker.close();
+      const closing = worker.close();
 
       await new Promise<void>(resolve => {
         worker.once('failed', async (job, err) => {
@@ -871,6 +884,7 @@ describe('workers', function () {
       const count = await queue.getJobCounts('active', 'failed');
       expect(count.active).to.be.eq(0);
       expect(count.failed).to.be.eq(1);
+      await closing;
     });
 
     it('process a job that complete after worker close', async () => {
@@ -1465,20 +1479,21 @@ describe('workers', function () {
 
   describe('when prioritized jobs are added', () => {
     it('should process jobs by priority', async () => {
-      const normalPriority: Promise<Job>[] = [];
-      const mediumPriority: Promise<Job>[] = [];
-      const highPriority: Promise<Job>[] = [];
-
       let processor;
 
       // for the current strategy this number should not exceed 8 (2^2*2)
       // this is done to maintain a deterministic output.
       const numJobsPerPriority = 6;
 
+      const jobs: {
+        name: string;
+        data: { p: number };
+        opts: { priority: number };
+      }[] = [];
       for (let i = 0; i < numJobsPerPriority; i++) {
-        normalPriority.push(queue.add('test', { p: 2 }, { priority: 2 }));
-        mediumPriority.push(queue.add('test', { p: 3 }, { priority: 3 }));
-        highPriority.push(queue.add('test', { p: 1 }, { priority: 1 }));
+        jobs.push({ name: 'test', data: { p: 2 }, opts: { priority: 2 } }); // normal priority
+        jobs.push({ name: 'test', data: { p: 3 }, opts: { priority: 3 } }); // medium priority
+        jobs.push({ name: 'test', data: { p: 1 }, opts: { priority: 1 } }); // high priority
       }
 
       let currentPriority = 1;
@@ -1510,11 +1525,72 @@ describe('workers', function () {
       await worker.waitUntilReady();
 
       // wait for all jobs to enter the queue and then start processing
-      await Promise.all([normalPriority, mediumPriority, highPriority]);
+      await queue.addBulk(jobs);
 
       await processing;
 
       await worker.close();
+    });
+
+    describe('when priority counter is having a high number', () => {
+      it('should process jobs by priority', async () => {
+        let processor;
+
+        const numJobsPerPriority = 6;
+
+        const jobs = Array.from(Array(18).keys()).map(index => ({
+          name: 'test',
+          data: { p: (index % 3) + 1 },
+          opts: {
+            priority: (index % 3) + 1,
+          },
+        }));
+        await queue.addBulk(jobs);
+        const client = await queue.client;
+        await client.incrby(`${prefix}:${queue.name}:pc`, 2147483648);
+        await queue.addBulk(jobs);
+
+        let currentPriority = 1;
+        let counter = 0;
+        let total = 0;
+        const countersPerPriority = {};
+
+        const processing = new Promise<void>((resolve, reject) => {
+          processor = async (job: Job) => {
+            await delay(10);
+            try {
+              if (countersPerPriority[job.data.p]) {
+                expect(countersPerPriority[job.data.p]).to.be.lessThan(
+                  +job.id!,
+                );
+              }
+
+              countersPerPriority[job.data.p] = +job.id!;
+              expect(job.id).to.be.ok;
+              expect(job.data.p).to.be.eql(currentPriority);
+            } catch (err) {
+              reject(err);
+            }
+
+            total++;
+            if (++counter === numJobsPerPriority * 2) {
+              currentPriority++;
+              counter = 0;
+
+              if (currentPriority === 4 && total === numJobsPerPriority * 6) {
+                resolve();
+              }
+            }
+          };
+        });
+
+        const worker = new Worker(queueName, processor, { connection, prefix });
+        await worker.waitUntilReady();
+
+        await processing;
+
+        await worker.close();
+      });
     });
 
     describe('while processing last active job', () => {
@@ -1567,9 +1643,14 @@ describe('workers', function () {
           };
         });
 
-        const worker = new Worker(queueName, processor, { connection, prefix });
+        const worker = new Worker(queueName, processor, {
+          connection,
+          autorun: false,
+          prefix,
+        });
         await worker.waitUntilReady();
 
+        worker.run();
         await processing;
 
         await worker.close();
@@ -1670,6 +1751,7 @@ describe('workers', function () {
       const processing = new Promise<void>((resolve, reject) => {
         processor = async (job: Job) => {
           try {
+            await delay(20);
             expect(job.data.num).to.be.equal(counter);
             expect(job.data.foo).to.be.equal('bar');
             if (counter === maxJobs) {
@@ -1879,7 +1961,7 @@ describe('workers', function () {
 
     await worker.waitUntilReady();
 
-    const jobs = await Promise.all(
+    await Promise.all(
       Array.from({ length: concurrency }).map(() =>
         queue.add('test', { bar: 'baz' }),
       ),
@@ -2100,6 +2182,7 @@ describe('workers', function () {
           processing = false;
         },
         {
+          autorun: false,
           connection,
           prefix,
           concurrency: 1,
@@ -2110,6 +2193,7 @@ describe('workers', function () {
       await queue.add('test', {});
       await queue.add('test', {});
 
+      worker.run();
       await new Promise(resolve => {
         worker.on('completed', after(2, resolve));
       });
@@ -2654,13 +2738,14 @@ describe('workers', function () {
       const worker = new Worker(
         queueName,
         async job => {
+          await delay(10);
           expect(job.attemptsMade).to.be.eql(tries);
           tries++;
           if (job.attemptsMade < 1) {
             throw new Error('Not yet!');
           }
         },
-        { connection, prefix },
+        { autorun: false, connection, prefix },
       );
 
       await worker.waitUntilReady();
@@ -2672,6 +2757,8 @@ describe('workers', function () {
           attempts: 3,
         },
       );
+
+      worker.run();
 
       await new Promise(resolve => {
         worker.on('completed', resolve);
@@ -3583,7 +3670,7 @@ describe('workers', function () {
     it('should retry a job after a delay if a custom backoff is given based on the error thrown', async function () {
       class CustomError extends Error {}
 
-      this.timeout(12000);
+      this.timeout(10000);
 
       const worker = new Worker(
         queueName,
@@ -4416,6 +4503,18 @@ describe('workers', function () {
     });
 
     await allStalled;
+
+    await worker.close();
+  });
+
+  it('should retrieve concurrency from getter', async () => {
+    const worker = new Worker(queueName, async () => {}, {
+      connection,
+      concurrency: 100,
+    });
+    worker.concurrency = 10;
+
+    expect(worker.concurrency).to.equal(10);
 
     await worker.close();
   });

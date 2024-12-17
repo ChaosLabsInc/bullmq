@@ -486,6 +486,128 @@ describe('Rate Limiter', function () {
       });
     });
 
+    describe('when passing maxJobs when getting rate limit ttl', () => {
+      describe('when rate limit counter is lower than maxJobs', () => {
+        it('should returns 0', async function () {
+          this.timeout(4000);
+
+          const numJobs = 1;
+          const duration = 100;
+
+          const ttl = await queue.getRateLimitTtl();
+          expect(ttl).to.be.equal(-2);
+
+          const worker = new Worker(
+            queueName,
+            async job => {
+              if (job.attemptsStarted === 1) {
+                delay(50);
+                const currentTtl = await queue.getRateLimitTtl(2);
+                expect(currentTtl).to.be.equal(0);
+              }
+            },
+            {
+              connection,
+              prefix,
+              maxStalledCount: 0,
+              limiter: {
+                max: 2,
+                duration,
+              },
+            },
+          );
+
+          const result = new Promise<void>((resolve, reject) => {
+            queueEvents.on(
+              'completed',
+              // after every job has been completed
+              after(numJobs, async () => {
+                try {
+                  resolve();
+                } catch (err) {
+                  reject(err);
+                }
+              }),
+            );
+
+            queueEvents.on('failed', async err => {
+              await worker.close();
+              reject(err);
+            });
+          });
+
+          const jobs = Array.from(Array(numJobs).keys()).map(() => ({
+            name: 'rate test',
+            data: {},
+          }));
+          await queue.addBulk(jobs);
+
+          await result;
+          await worker.close();
+        });
+      });
+
+      describe('when rate limit counter is greater than maxJobs', () => {
+        it('should returns at least rate limit duration', async function () {
+          this.timeout(4000);
+
+          const numJobs = 10;
+          const duration = 100;
+
+          const ttl = await queue.getRateLimitTtl();
+          expect(ttl).to.be.equal(-2);
+
+          const worker = new Worker(
+            queueName,
+            async job => {
+              if (job.attemptsStarted === 1) {
+                delay(50);
+                const currentTtl = await queue.getRateLimitTtl(1);
+                expect(currentTtl).to.be.lessThanOrEqual(duration);
+              }
+            },
+            {
+              connection,
+              prefix,
+              maxStalledCount: 0,
+              limiter: {
+                max: 1,
+                duration,
+              },
+            },
+          );
+
+          const result = new Promise<void>((resolve, reject) => {
+            queueEvents.on(
+              'completed',
+              // after every job has been completed
+              after(numJobs, async () => {
+                try {
+                  resolve();
+                } catch (err) {
+                  reject(err);
+                }
+              }),
+            );
+
+            queueEvents.on('failed', async err => {
+              await worker.close();
+              reject(err);
+            });
+          });
+
+          const jobs = Array.from(Array(numJobs).keys()).map(() => ({
+            name: 'rate test',
+            data: {},
+          }));
+          await queue.addBulk(jobs);
+
+          await result;
+          await worker.close();
+        });
+      });
+    });
+
     describe('when reaching max attempts and we want to move the job to failed', () => {
       it('should throw Unrecoverable error', async function () {
         const dynamicLimit = 550;
@@ -720,6 +842,64 @@ describe('Rate Limiter', function () {
         const pausedCount = await queue.getJobCountByTypes('paused');
         expect(pausedCount).to.equal(1);
 
+        await worker.close();
+      });
+    });
+
+    describe('when removing rate limit', () => {
+      it('should process jobs normally', async function () {
+        this.timeout(5000);
+
+        const numJobs = 2;
+        const dynamicLimit = 10000;
+        const duration = 1000;
+
+        const ttl = await queue.getRateLimitTtl();
+        expect(ttl).to.be.equal(-2);
+
+        const worker = new Worker(queueName, async () => {}, {
+          autorun: false,
+          connection,
+          prefix,
+          limiter: {
+            max: 1,
+            duration,
+          },
+        });
+
+        await worker.rateLimit(dynamicLimit);
+
+        await queue.removeRateLimitKey();
+        const result = new Promise<void>((resolve, reject) => {
+          queueEvents.on(
+            'completed',
+            // after every job has been completed
+            after(numJobs, async () => {
+              try {
+                const timeDiff = new Date().getTime() - startTime;
+                expect(timeDiff).to.be.gte((numJobs - 1) * duration);
+                expect(timeDiff).to.be.lte(numJobs * duration);
+                resolve();
+              } catch (err) {
+                reject(err);
+              }
+            }),
+          );
+
+          queueEvents.on('failed', async err => {
+            reject(err);
+          });
+        });
+
+        const startTime = new Date().getTime();
+        const jobs = Array.from(Array(numJobs).keys()).map(() => ({
+          name: 'rate test',
+          data: {},
+        }));
+        await queue.addBulk(jobs);
+
+        worker.run();
+        await result;
         await worker.close();
       });
     });
