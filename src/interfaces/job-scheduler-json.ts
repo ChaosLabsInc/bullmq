@@ -9,10 +9,13 @@ export interface JobSchedulerJson<D = any> {
   key: string; // key is actually the job scheduler id
   name: string;
   id?: string | null;
-  endDate: number | null;
-  tz: string | null;
-  pattern: string | null;
-  every?: string | null;
+  iterationCount?: number;
+  limit?: number;
+  endDate?: number;
+  tz?: string;
+  pattern?: string;
+  every?: number;
   next?: number;
+  offset?: number;
   template?: JobSchedulerTemplateJson<D>;
 }

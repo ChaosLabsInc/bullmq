@@ -9,14 +9,17 @@ import { CONNECTION_CLOSED_ERROR_MSG } from 'ioredis/built/utils';
 import {
   ChildMessage,
   ContextManager,
+  ParentOptions,
   RedisClient,
   Span,
   Tracer,
 } from './interfaces';
+import { Scripts } from './classes/scripts';
 import { EventEmitter } from 'events';
 import * as semver from 'semver';
 
 import { SpanKind, TelemetryAttributes } from './enums';
+import { MinimalQueue } from './types';
 
 export const errorObject: { [index: string]: any } = { value: null };
 
@@ -78,6 +81,7 @@ export function delay(
   abortController?: AbortController,
 ): Promise<void> {
   return new Promise(resolve => {
+    // eslint-disable-next-line prefer-const
     let timeout: ReturnType<typeof setTimeout> | undefined;
     const callback = () => {
       abortController?.signal.removeEventListener('abort', callback);
@@ -111,6 +115,20 @@ export function invertObject<T extends Record<PropertyKey, PropertyKey>>(
     return result;
   }, {} as Invert<T>);
 }
+
+export const optsDecodeMap = {
+  de: 'deduplication',
+  fpof: 'failParentOnFailure',
+  cpof: 'continueParentOnFailure',
+  idof: 'ignoreDependencyOnFailure',
+  kl: 'keepLogs',
+  rdof: 'removeDependencyOnFailure',
+} as const;
+
+export const optsEncodeMap = {
+  ...invertObject(optsDecodeMap),
+  /*/ Legacy for backwards compatibility */ debounce: 'de', // TODO: remove in next breaking change
+} as const;
 
 export function isRedisInstance(obj: any): obj is Redis | Cluster {
   if (!obj) {
@@ -164,10 +182,7 @@ export async function removeAllQueueData(
   await client.quit();
 }
 
-export function getParentKey(opts: {
-  id: string;
-  queue: string;
-}): string | undefined {
+export function getParentKey(opts: ParentOptions): string | undefined {
   if (opts) {
     return `${opts.queue}:${opts.id}`;
   }
@@ -218,6 +233,22 @@ export const childSend = (
   proc: NodeJS.Process,
   msg: ChildMessage,
 ): Promise<void> => asyncSend<NodeJS.Process>(proc, msg);
+
+/**
+ * Factory method to create a Scripts object.
+ */
+export const createScripts = (queue: MinimalQueue) => {
+  return new Scripts({
+    keys: queue.keys,
+    client: queue.client,
+    get redisVersion() {
+      return queue.redisVersion;
+    },
+    toKey: queue.toKey,
+    opts: queue.opts,
+    closing: queue.closing,
+  });
+};
 
 export const isRedisVersionLowerThan = (
   currentVersion: string,

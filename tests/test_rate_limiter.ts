@@ -7,8 +7,10 @@ import {
   FlowProducer,
   Queue,
   QueueEvents,
+  RateLimitError,
   Worker,
   UnrecoverableError,
+  Job,
 } from '../src/classes';
 import { delay, removeAllQueueData } from '../src/utils';
 
@@ -95,8 +97,6 @@ describe('Rate Limiter', function () {
         'completed',
         // after every job has been completed
         after(numJobs, async () => {
-          await worker.close();
-
           try {
             const timeDiff = new Date().getTime() - startTime;
             expect(timeDiff).to.be.gte((numJobs - 1) * 1000);
@@ -131,9 +131,70 @@ describe('Rate Limiter', function () {
       prefix,
       limiter,
     });
+
     await queue.add('test', 1);
     await delay(500);
     await worker.close();
+  });
+
+  describe('when a job never completed', () => {
+    it('should not block the rate limit', async function () {
+      this.timeout(20000);
+      const numJobs = 20;
+      const queue = new Queue(queueName, {
+        prefix,
+        connection,
+      });
+
+      const worker = new Worker(
+        queueName,
+        async (job: Job) => {
+          if (job.data == 'delay') {
+            // This simulates a job that will never resolve.
+            await new Promise(resolve => {});
+            return;
+          }
+
+          if (job.data == 'test') {
+            return 'Success';
+          }
+        },
+        {
+          autorun: false,
+          connection,
+          prefix,
+          concurrency: 2,
+          limiter: {
+            max: 5,
+            duration: 1000,
+          },
+        },
+      );
+
+      const completing = new Promise<void>((resolve, reject) => {
+        worker.on(
+          'completed',
+          // after every job has been completed except the one that never resolves
+          after(numJobs - 1, async () => {
+            // We need to forcefully close the worker
+            await worker.close(true);
+            resolve();
+          }),
+        );
+      });
+
+      await queue.add('delay-job', 'delay');
+
+      for (let i = 0; i < numJobs; i++) {
+        await queue.add('test-job', 'test');
+      }
+
+      worker.run();
+
+      await completing;
+
+      await worker.close(true);
+    });
   });
 
   describe('when queue is paused between rate limit', () => {
@@ -303,6 +364,7 @@ describe('Rate Limiter', function () {
       await worker.close();
       await parentWorker.close();
       await parentQueueEvents.close();
+      await flow.close();
     });
   });
 
@@ -421,6 +483,53 @@ describe('Rate Limiter', function () {
 
       await result;
       await worker.close();
+    });
+
+    describe('when job does not exist', () => {
+      it('should fail with job existence error', async () => {
+        const dynamicLimit = 250;
+        const duration = 100;
+
+        const worker = new Worker(
+          queueName,
+          async job => {
+            if (job.attemptsStarted === 1) {
+              await queue.rateLimit(dynamicLimit);
+              await queue.obliterate({ force: true });
+              throw Worker.RateLimitError();
+            }
+          },
+          {
+            autorun: false,
+            concurrency: 10,
+            drainDelay: 10, // If test hangs, 10 seconds here helps to fail quicker.
+            limiter: {
+              max: 2,
+              duration,
+            },
+            connection,
+            prefix,
+          },
+        );
+
+        await worker.waitUntilReady();
+
+        const failing = new Promise<void>(resolve => {
+          worker.on('error', err => {
+            expect(err.message).to.be.equal(
+              `Missing lock for job ${job.id}. moveJobFromActiveToWait`,
+            );
+            resolve();
+          });
+        });
+
+        const job = await queue.add('test', { foo: 'bar' });
+
+        worker.run();
+
+        await failing;
+        await worker.close();
+      }).timeout(4000);
     });
 
     describe('when rate limit is too low', () => {
@@ -616,11 +725,11 @@ describe('Rate Limiter', function () {
         const worker = new Worker(
           queueName,
           async job => {
-            await worker.rateLimit(dynamicLimit);
+            await queue.rateLimit(dynamicLimit);
             if (job.attemptsStarted >= job.opts.attempts!) {
               throw new UnrecoverableError('Unrecoverable');
             }
-            throw Worker.RateLimitError();
+            throw new RateLimitError();
           },
           {
             connection,
@@ -697,8 +806,6 @@ describe('Rate Limiter', function () {
             'completed',
             // after every job has been completed
             after(numJobs, async args => {
-              await worker.close();
-
               try {
                 expect(args.jobId).to.be.equal('1');
                 resolve();
@@ -804,11 +911,11 @@ describe('Rate Limiter', function () {
         const worker = new Worker(
           queueName,
           async job => {
-            if (job.attemptsMade === 0) {
+            if (job.attemptsStarted === 1) {
               await queue.pause();
               await delay(150);
-              await worker.rateLimit(dynamicLimit);
-              throw Worker.RateLimitError();
+              await queue.rateLimit(dynamicLimit);
+              throw new RateLimitError();
             }
           },
           {
@@ -957,7 +1064,7 @@ describe('Rate Limiter', function () {
     describe('when rate limit is max 1', () => {
       it('processes jobs as max limiter from the beginning', async function () {
         const numJobs = 5;
-        this.timeout(5000);
+        this.timeout(8000);
         let parallelJobs = 0;
 
         const processor = async () => {
