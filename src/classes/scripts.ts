@@ -25,6 +25,7 @@ import {
   MoveToDelayedOpts,
   RepeatableOptions,
   RetryJobOpts,
+  ScriptQueueContext,
 } from '../interfaces';
 import {
   JobsOptions,
@@ -32,7 +33,6 @@ import {
   JobType,
   FinishedStatus,
   FinishedPropValAttribute,
-  ScriptQueueContext,
   RedisJobOptions,
   JobProgress,
 } from '../types';
@@ -45,6 +45,7 @@ import {
 } from '../utils';
 import { ChainableCommander } from 'ioredis';
 import { version as packageVersion } from '../version';
+import { UnrecoverableError } from './errors';
 export type JobData = [JobJsonRaw | number, string?];
 
 export class Scripts {
@@ -369,7 +370,7 @@ export class Scripts {
     delayedJobOpts: JobsOptions,
     // The job id of the job that produced this next iteration
     producerId?: string,
-  ): Promise<string> {
+  ): Promise<[string, number]> {
     const client = await this.queue.client;
     const queueKeys = this.queue.keys;
 
@@ -399,7 +400,20 @@ export class Scripts {
       producerId ? this.queue.toKey(producerId) : '',
     ];
 
-    return this.execCommand(client, 'addJobScheduler', keys.concat(args));
+    const result = await this.execCommand(
+      client,
+      'addJobScheduler',
+      keys.concat(args),
+    );
+
+    if (typeof result === 'number' && result < 0) {
+      throw this.finishedErrors({
+        code: result,
+        command: 'addJobScheduler',
+      });
+    }
+
+    return result;
   }
 
   async updateRepeatableJobMillis(
@@ -732,8 +746,8 @@ export class Scripts {
     return typeof shouldRemove === 'object'
       ? shouldRemove
       : typeof shouldRemove === 'number'
-      ? { count: shouldRemove }
-      : { count: shouldRemove ? 0 : -1 };
+        ? { count: shouldRemove }
+        : { count: shouldRemove ? 0 : -1 };
   }
 
   async moveToFinished(
@@ -1077,6 +1091,7 @@ export class Scripts {
     opts: MoveToDelayedOpts = {},
   ): (string | number | Buffer)[] {
     const queueKeys = this.queue.keys;
+
     const keys: (string | number | Buffer)[] = [
       queueKeys.marker,
       queueKeys.active,
@@ -1117,7 +1132,6 @@ export class Scripts {
       `${jobId}:dependencies`,
       `${jobId}:unsuccessful`,
       'stalled',
-      'failed',
       'events',
     ].map(name => {
       return this.queue.toKey(name);
@@ -1209,7 +1223,10 @@ export class Scripts {
   }
 
   getRateLimitTtlArgs(maxJobs?: number): (string | number)[] {
-    const keys: (string | number)[] = [this.queue.keys.limiter];
+    const keys: (string | number)[] = [
+      this.queue.keys.limiter,
+      this.queue.keys.meta,
+    ];
 
     return keys.concat([maxJobs ?? '0']);
   }
@@ -1407,6 +1424,28 @@ export class Scripts {
           state,
         });
     }
+  }
+
+  async getMetrics(
+    type: 'completed' | 'failed',
+    start = 0,
+    end = -1,
+  ): Promise<[string[], string[], number]> {
+    const client = await this.queue.client;
+
+    const keys: (string | number)[] = [
+      this.queue.toKey(`metrics:${type}`),
+      this.queue.toKey(`metrics:${type}:data`),
+    ];
+    const args = [start, end];
+
+    const result = await this.execCommand(
+      client,
+      'getMetrics',
+      keys.concat(args),
+    );
+
+    return result;
   }
 
   async moveToActive(client: RedisClient, token: string, name?: string) {
@@ -1681,36 +1720,66 @@ export class Scripts {
     command: string;
     state?: string;
   }): Error {
+    let error: Error;
     switch (code) {
       case ErrorCode.JobNotExist:
-        return new Error(`Missing key for job ${jobId}. ${command}`);
+        error = new Error(`Missing key for job ${jobId}. ${command}`);
+        break;
       case ErrorCode.JobLockNotExist:
-        return new Error(`Missing lock for job ${jobId}. ${command}`);
+        error = new Error(`Missing lock for job ${jobId}. ${command}`);
+        break;
       case ErrorCode.JobNotInState:
-        return new Error(
+        error = new Error(
           `Job ${jobId} is not in the ${state} state. ${command}`,
         );
+        break;
       case ErrorCode.JobPendingChildren:
-        return new Error(`Job ${jobId} has pending dependencies. ${command}`);
+        error = new Error(`Job ${jobId} has pending dependencies. ${command}`);
+        break;
       case ErrorCode.ParentJobNotExist:
-        return new Error(`Missing key for parent job ${parentKey}. ${command}`);
+        error = new Error(
+          `Missing key for parent job ${parentKey}. ${command}`,
+        );
+        break;
       case ErrorCode.JobLockMismatch:
-        return new Error(
+        error = new Error(
           `Lock mismatch for job ${jobId}. Cmd ${command} from ${state}`,
         );
+        break;
       case ErrorCode.ParentJobCannotBeReplaced:
-        return new Error(
+        error = new Error(
           `The parent job ${parentKey} cannot be replaced. ${command}`,
         );
+        break;
       case ErrorCode.JobBelongsToJobScheduler:
-        return new Error(
+        error = new Error(
           `Job ${jobId} belongs to a job scheduler and cannot be removed directly. ${command}`,
         );
-      case ErrorCode.JobFailedChildren:
-        return new Error(`Job ${jobId} has failed children. ${command}`);
+        break;
+      case ErrorCode.JobHasFailedChildren:
+        error = new UnrecoverableError(
+          `Cannot complete job ${jobId} because it has at least one failed child. ${command}`,
+        );
+        break;
+      case ErrorCode.SchedulerJobIdCollision:
+        error = new Error(
+          `Cannot create job scheduler iteration - job ID already exists. ${command}`,
+        );
+        break;
+      case ErrorCode.SchedulerJobSlotsBusy:
+        error = new Error(
+          `Cannot create job scheduler iteration - current and next time slots already have jobs. ${command}`,
+        );
+        break;
       default:
-        return new Error(`Unknown code ${code} error for ${jobId}. ${command}`);
+        error = new Error(
+          `Unknown code ${code} error for ${jobId}. ${command}`,
+        );
     }
+
+    // Add the code property to the error object
+    (error as any).code = code;
+    return error;
   }
 }
 

@@ -77,7 +77,7 @@ describe('Cleaner', () => {
       );
     });
 
-    const addedJobs = await queue.addBulk([
+    await queue.addBulk([
       { name: 'test', data: { some: 'data' } },
       { name: 'test', data: { some: 'data' } },
     ]);
@@ -212,6 +212,45 @@ describe('Cleaner', () => {
       await delay(50);
 
       const jobs = await queue.clean(0, 0, 'failed');
+      expect(jobs.length).to.be.eql(3);
+      const count = await queue.count();
+      expect(count).to.be.eql(1);
+
+      await worker.close();
+    });
+
+    it('should clean all completed jobs', async () => {
+      const worker = new Worker(
+        queueName,
+        async () => {
+          await delay(100);
+        },
+        { connection, prefix, autorun: false },
+      );
+      await worker.waitUntilReady();
+
+      await queue.addBulk([
+        {
+          name: 'test',
+          data: { some: 'data' },
+        },
+        {
+          name: 'test',
+          data: { some: 'data' },
+        },
+      ]);
+      await queue.upsertJobScheduler('test-scheduler1', { every: 5000 });
+
+      const completing = new Promise(resolve => {
+        queueEvents.on('completed', after(3, resolve));
+      });
+
+      worker.run();
+
+      await completing;
+      await delay(50);
+
+      const jobs = await queue.clean(0, 0, 'completed');
       expect(jobs.length).to.be.eql(3);
       const count = await queue.count();
       expect(count).to.be.eql(1);
@@ -782,5 +821,67 @@ describe('Cleaner', () => {
     expect(failed.length).to.be.eql(0);
 
     await worker.close();
+  });
+
+  // Test for wait vs waiting consistency fix
+  it('should accept both "wait" and "waiting" in clean method', async () => {
+    // Add some jobs to the queue
+    await queue.add('test', { some: 'data' });
+    await queue.add('test', { some: 'data' });
+    await queue.add('test', { some: 'data' });
+
+    await delay(100);
+
+    const counts = await queue.getJobCounts();
+    expect(counts).to.have.property('waiting');
+    expect(counts.waiting).to.be.eql(3);
+
+    const cleanedWithWait = await queue.clean(0, 2, 'wait');
+    expect(cleanedWithWait.length).to.be.eql(2);
+
+    const remainingCount = await queue.count();
+    expect(remainingCount).to.be.eql(1);
+
+    await queue.add('test', { some: 'data' });
+    await queue.add('test', { some: 'data' });
+    await delay(100);
+
+    const cleanedWithWaiting = await queue.clean(0, 10, 'waiting');
+    expect(cleanedWithWaiting.length).to.be.eql(3);
+
+    const finalCount = await queue.count();
+    expect(finalCount).to.be.eql(0);
+  });
+
+  it('should emit correct events for both "wait" and "waiting" clean operations', async () => {
+    await queue.add('test', { some: 'data' });
+    await queue.add('test', { some: 'data' });
+    await delay(100);
+
+    let cleanedEventFired = false;
+    let cleanedType = '';
+    let cleanedJobs: string[] = [];
+
+    queue.on('cleaned', (jobs, type) => {
+      cleanedEventFired = true;
+      cleanedType = type;
+      cleanedJobs = jobs;
+    });
+
+    await queue.clean(0, 1, 'wait');
+
+    expect(cleanedEventFired).to.be.true;
+    expect(cleanedType).to.be.eql('wait');
+    expect(cleanedJobs.length).to.be.eql(1);
+
+    cleanedEventFired = false;
+    cleanedType = '';
+    cleanedJobs = [];
+
+    await queue.clean(0, 1, 'waiting');
+
+    expect(cleanedEventFired).to.be.true;
+    expect(cleanedType).to.be.eql('wait');
+    expect(cleanedJobs.length).to.be.eql(1);
   });
 });

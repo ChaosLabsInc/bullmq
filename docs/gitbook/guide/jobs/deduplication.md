@@ -128,4 +128,5 @@ await myQueue.removeDeduplicationKey('customValue');
 ## Read more:
 
 - 💡 [Add Job API Reference](https://api.docs.bullmq.io/classes/v5.Queue.html#add)
-- 💡 [Remove Deduplication Key API Reference](https://api.docs.bullmq.io/classes/v5.Queue.html#removeDeduplicationKey)
+- 💡 [Remove Deduplication Key API Reference](https://api.docs.bullmq.io/classes/v5.Queue.html#removededuplicationkey)
+- 💡 [Deduplication Patterns](../../patterns/deduplication.md)

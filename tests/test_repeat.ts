@@ -45,7 +45,10 @@ describe('repeat', function () {
   });
 
   beforeEach(async function () {
-    this.clock = sinon.useFakeTimers({ shouldClearNativeTimers: true });
+    this.clock = sinon.useFakeTimers({
+      shouldClearNativeTimers: true,
+      toFake: ['Date', 'setTimeout', 'clearTimeout'],
+    });
     queueName = `test-${v4()}`;
     queue = new Queue(queueName, { connection, prefix });
     repeat = new Repeat(queueName, { connection, prefix });
@@ -347,6 +350,61 @@ describe('repeat', function () {
     await completing;
     await worker.close();
     delayStub.restore();
+  });
+
+  describe('when using legacy key', function () {
+    it('should repeat every 2 seconds', async function () {
+      this.timeout(10000);
+
+      const nextTick = 2 * ONE_SECOND + 100;
+
+      const worker = new Worker(
+        queueName,
+        async () => {
+          this.clock.tick(nextTick);
+        },
+        { autorun: false, connection, prefix },
+      );
+      const delayStub = sinon.stub(worker, 'delay').callsFake(NoopProc);
+
+      const date = new Date('2017-02-07 9:24:00');
+      this.clock.setSystemTime(date);
+
+      await queue.add(
+        'test',
+        { foo: 'bar' },
+        { repeat: { pattern: '*/2 * * * * *', key: 'test::::*/2 * * * * *' } },
+      );
+
+      this.clock.tick(nextTick);
+
+      let prev: any;
+      let counter = 0;
+
+      const completing = new Promise<void>((resolve, rejects) => {
+        worker.on('completed', async job => {
+          try {
+            if (prev) {
+              expect(prev.timestamp).to.be.lt(job.timestamp);
+              expect(job.timestamp - prev.timestamp).to.be.gte(2000);
+            }
+            prev = job;
+            counter++;
+            if (counter == 5) {
+              resolve();
+            }
+          } catch (error) {
+            rejects(error);
+          }
+        });
+      });
+
+      worker.run();
+
+      await completing;
+      await worker.close();
+      delayStub.restore();
+    });
   });
 
   it('should repeat every 2 seconds with startDate in future', async function () {
@@ -1924,9 +1982,7 @@ describe('repeat', function () {
       queueEvents.on('waiting', function ({ jobId }) {
         try {
           expect(jobId).to.be.equal(
-            `repeat:16db7a9b166154f5c636abf3c8fe3364:${
-              date.getTime() + 1 * ONE_SECOND
-            }`,
+            `repeat:16db7a9b166154f5c636abf3c8fe3364:${date.getTime() + 1 * ONE_SECOND}`,
           );
           resolve();
         } catch (err) {

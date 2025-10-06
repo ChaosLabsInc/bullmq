@@ -198,6 +198,26 @@ describe('Job', function () {
       });
     });
 
+    describe('when deduplication id option is provided as empty string', () => {
+      it('throws an error', async () => {
+        const data = { foo: 'bar' };
+        const opts = { deduplication: { id: '' } };
+        await expect(Job.create(queue, 'test', data, opts)).to.be.rejectedWith(
+          'Deduplication id must be provided',
+        );
+      });
+    });
+
+    describe('when debounce id option is provided as empty string', () => {
+      it('throws an error', async () => {
+        const data = { foo: 'bar' };
+        const opts = { debounce: { id: '' } };
+        await expect(Job.create(queue, 'test', data, opts)).to.be.rejectedWith(
+          'Debounce id must be provided',
+        );
+      });
+    });
+
     describe('when jitter backoff option is provided with a value lesser than 0', () => {
       it('throws an error', async () => {
         const data = { foo: 'bar' };
@@ -280,7 +300,9 @@ describe('Job', function () {
       const job = await Job.create<{ foo?: string; baz?: string }>(
         queue,
         'test',
-        { foo: 'bar' },
+        {
+          foo: 'bar',
+        },
       );
       await job.updateData({ baz: 'qux' });
 
@@ -676,7 +698,7 @@ describe('Job', function () {
       const data = { foo: 'bar' };
       const parent = await Job.create(parentQueue, 'testParent', data);
       const parentKey = getParentKey({
-        id: parent.id,
+        id: parent.id!,
         queue: `${prefix}:${parentQueueName}`,
       });
       const client = await queue.client;
@@ -687,7 +709,7 @@ describe('Job', function () {
       });
       await Job.create(queue, 'testJob2', values[1], {
         parent: {
-          id: parent.id,
+          id: parent.id!,
           queue: `${prefix}:${parentQueueName}`,
         },
       });
@@ -1693,7 +1715,7 @@ describe('Job', function () {
         const completed = new Promise<void>((resolve, reject) => {
           worker.on('completed', async (job: Job) => {
             try {
-              const gotJob = await queue.getJob(job.id);
+              const gotJob = await queue.getJob(job.id!);
               expect(gotJob).to.be.equal(undefined);
               const counts = await queue.getJobCounts('completed');
               expect(counts.completed).to.be.equal(0);
@@ -1713,7 +1735,7 @@ describe('Job', function () {
         await completed;
 
         await expect(job.waitUntilFinished(queueEvents)).to.be.rejectedWith(
-          `Missing key for job ${queue.toKey(job.id)}. isFinished`,
+          `Missing key for job ${queue.toKey(job.id!)}. isFinished`,
         );
 
         await worker.close();

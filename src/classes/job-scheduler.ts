@@ -85,28 +85,12 @@ export class JobScheduler extends QueueBase {
     now = prevMillis < now ? now : prevMillis;
 
     // Check if we have a start date for the repeatable job
-    const { startDate, immediately, ...filteredRepeatOpts } = repeatOpts;
-    let startMillis = now;
-    if (startDate) {
-      startMillis = new Date(startDate).getTime();
-      startMillis = startMillis > now ? startMillis : now;
-    }
+    const { immediately, ...filteredRepeatOpts } = repeatOpts;
 
     let nextMillis: number;
-    let newOffset: number | null = null;
-    if (every) {
-      const prevSlot =
-        Math.floor((startMillis - (offset || 0)) / every) * every;
+    const newOffset: number | null = null;
 
-      newOffset = typeof offset === 'number' ? offset : startMillis - prevSlot;
-
-      const nextSlot = prevSlot + every;
-      if (prevMillis || offset) {
-        nextMillis = nextSlot;
-      } else {
-        nextMillis = prevSlot;
-      }
-    } else if (pattern) {
+    if (pattern) {
       nextMillis = await this.repeatStrategy(now, repeatOpts, jobName);
 
       if (nextMillis < now) {
@@ -114,7 +98,7 @@ export class JobScheduler extends QueueBase {
       }
     }
 
-    if (nextMillis) {
+    if (nextMillis || every) {
       return this.trace<Job<T, R, N>>(
         SpanKind.PRODUCER,
         'add',
@@ -149,13 +133,21 @@ export class JobScheduler extends QueueBase {
           );
 
           if (override) {
-            const jobId = await this.scripts.addJobScheduler(
+            // Clamp nextMillis to now if it's in the past
+            if (nextMillis < now) {
+              nextMillis = now;
+            }
+
+            const [jobId, delay] = await this.scripts.addJobScheduler(
               jobSchedulerId,
               nextMillis,
               JSON.stringify(typeof jobData === 'undefined' ? {} : jobData),
               Job.optsAsJSON(opts),
               {
                 name: jobName,
+                startDate: repeatOpts.startDate
+                  ? new Date(repeatOpts.startDate).getTime()
+                  : undefined,
                 endDate: endDate ? new Date(endDate).getTime() : undefined,
                 tz: repeatOpts.tz,
                 pattern,
@@ -167,11 +159,15 @@ export class JobScheduler extends QueueBase {
               producerId,
             );
 
+            // Ensure delay is a number (Dragonflydb may return it as a string)
+            const numericDelay =
+              typeof delay === 'string' ? parseInt(delay, 10) : delay;
+
             const job = new this.Job<T, R, N>(
               this,
               jobName,
               jobData,
-              mergedOpts,
+              { ...mergedOpts, delay: numericDelay },
               jobId,
             );
 
@@ -247,6 +243,9 @@ export class JobScheduler extends QueueBase {
       ...opts.repeat,
       offset,
       count: currentCount,
+      startDate: opts.repeat?.startDate
+        ? new Date(opts.repeat.startDate).getTime()
+        : undefined,
       endDate: opts.repeat?.endDate
         ? new Date(opts.repeat.endDate).getTime()
         : undefined,
@@ -273,7 +272,7 @@ export class JobScheduler extends QueueBase {
     key: string,
     jobData: any,
     next?: number,
-  ): JobSchedulerJson<D> {
+  ): JobSchedulerJson<D> | undefined {
     if (jobData) {
       const jobSchedulerData: JobSchedulerJson<D> = {
         key,
@@ -287,6 +286,10 @@ export class JobScheduler extends QueueBase {
 
       if (jobData.limit) {
         jobSchedulerData.limit = parseInt(jobData.limit);
+      }
+
+      if (jobData.startDate) {
+        jobSchedulerData.startDate = parseInt(jobData.startDate);
       }
 
       if (jobData.endDate) {
@@ -411,7 +414,9 @@ export const defaultRepeatStrategy = (
 ): number | undefined => {
   const { pattern } = opts;
 
-  const currentDate = new Date(millis);
+  const dateFromMillis = new Date(millis);
+  const startDate = opts.startDate && new Date(opts.startDate);
+  const currentDate = startDate > dateFromMillis ? startDate : dateFromMillis;
   const interval = parseExpression(pattern, {
     ...opts,
     currentDate,

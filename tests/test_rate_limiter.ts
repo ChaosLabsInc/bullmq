@@ -21,7 +21,7 @@ describe('Rate Limiter', function () {
   let queueName: string;
   let queueEvents: QueueEvents;
 
-  let connection;
+  let connection: IORedis;
   before(async function () {
     connection = new IORedis(redisHost, { maxRetriesPerRequest: null });
   });
@@ -78,8 +78,62 @@ describe('Rate Limiter', function () {
     await worker.close();
   });
 
+  describe('when setting rate limit globally', () => {
+    it('should obey the rate limit', async function () {
+      this.timeout(7000);
+
+      const numJobs = 10;
+
+      const worker = new Worker(
+        queueName,
+        async () => {
+          const currentTtl = await queue.getRateLimitTtl();
+          expect(currentTtl).to.be.lessThanOrEqual(500);
+          expect(currentTtl).to.be.greaterThan(200);
+        },
+        {
+          connection,
+          prefix,
+        },
+      );
+
+      await queue.setGlobalRateLimit(1, 500);
+
+      const result = new Promise<void>((resolve, reject) => {
+        queueEvents.on(
+          'completed',
+          // after every job has been completed
+          after(numJobs, async () => {
+            try {
+              const timeDiff = new Date().getTime() - startTime;
+              expect(timeDiff).to.be.gte((numJobs - 1) * 500);
+              resolve();
+            } catch (err) {
+              reject(err);
+            }
+          }),
+        );
+
+        queueEvents.on('failed', async err => {
+          await worker.close();
+          reject(err);
+        });
+      });
+
+      const startTime = new Date().getTime();
+      const jobs = Array.from(Array(numJobs).keys()).map(() => ({
+        name: 'rate test',
+        data: {},
+      }));
+      await queue.addBulk(jobs);
+
+      await result;
+      await worker.close();
+    });
+  });
+
   it('should obey the rate limit', async function () {
-    this.timeout(20000);
+    this.timeout(15000);
 
     const numJobs = 10;
 
@@ -114,6 +168,57 @@ describe('Rate Limiter', function () {
     });
 
     const startTime = new Date().getTime();
+    const jobs = Array.from(Array(numJobs).keys()).map(() => ({
+      name: 'rate test',
+      data: {},
+    }));
+    await queue.addBulk(jobs);
+
+    await result;
+    await worker.close();
+  });
+
+  it('should respect processing time without adding limiter delay', async function () {
+    this.timeout(12000);
+
+    const numJobs = 40;
+
+    const worker = new Worker(
+      queueName,
+      async () => {
+        await delay(Math.floor(1 + Math.random() * 4));
+      },
+      {
+        connection,
+        prefix,
+        concurrency: 5,
+        limiter: {
+          max: 4,
+          duration: 1000,
+        },
+      },
+    );
+
+    let completedCount = 0;
+    const result = new Promise<void>((resolve, reject) => {
+      worker.on('completed', async job => {
+        try {
+          completedCount++;
+          expect(job.finishedOn! - job.processedOn!).to.be.lte(1000);
+          if (completedCount === numJobs) {
+            resolve();
+          }
+        } catch (err) {
+          reject(err);
+        }
+      });
+
+      queueEvents.on('failed', async err => {
+        await worker.close();
+        reject(err);
+      });
+    });
+
     const jobs = Array.from(Array(numJobs).keys()).map(() => ({
       name: 'rate test',
       data: {},
@@ -517,7 +622,7 @@ describe('Rate Limiter', function () {
         const failing = new Promise<void>(resolve => {
           worker.on('error', err => {
             expect(err.message).to.be.equal(
-              `Missing lock for job ${job.id}. moveJobFromActiveToWait`,
+              `Missing key for job ${job.id}. moveJobFromActiveToWait`,
             );
             resolve();
           });

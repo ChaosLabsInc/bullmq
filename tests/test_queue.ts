@@ -50,6 +50,16 @@ describe('queues', function () {
       expect(job2?.data.bar).to.be.eql(1);
       await queue.close();
     });
+
+    it('should resolve Job<any, any, string> when no generics provided', async function () {
+      await queue.add('test-job', { foo: 'bar', num: 123 });
+
+      const jobs = await queue.getJobs(['waiting']);
+
+      expect(jobs).to.be.an('array');
+      expect(jobs.length).to.be.at.least(1);
+      expect(jobs[0]).to.be.instanceOf(Job);
+    });
   });
 
   it('should return the queue version', async () => {
@@ -74,12 +84,20 @@ describe('queues', function () {
       it('throws error', async function () {
         await expect(
           queue.add('test', { foo: 1 }, { jobId: '2' }),
-        ).to.be.rejectedWith('Custom Ids cannot be integers');
+        ).to.be.rejectedWith('Custom Id cannot be integers');
+      });
+    });
+
+    describe('when custom job id contains :', () => {
+      it('throws an error', async () => {
+        await expect(
+          queue.add('test', { foo: 1 }, { jobId: '1:0' }),
+        ).to.be.rejectedWith('Custom Id cannot contain :');
       });
     });
   });
 
-  describe('when empty name contains :', () => {
+  describe('when queue name contains :', () => {
     it('throws an error', function () {
       expect(
         () =>
@@ -291,14 +309,12 @@ describe('queues', function () {
             const countAfterEmpty = await queue.count();
             expect(countAfterEmpty).to.be.eql(0);
 
-            const childrenFailedCount = await queue.getJobCountByTypes(
-              'failed',
-            );
+            const childrenFailedCount =
+              await queue.getJobCountByTypes('failed');
             expect(childrenFailedCount).to.be.eql(0);
 
-            const parentWaitCount = await parentQueue.getJobCountByTypes(
-              'wait',
-            );
+            const parentWaitCount =
+              await parentQueue.getJobCountByTypes('wait');
             expect(parentWaitCount).to.be.eql(1);
             await parentQueue.close();
             await flow.close();
@@ -345,9 +361,8 @@ describe('queues', function () {
             const failedCount = await queue.getJobCountByTypes('failed');
             expect(failedCount).to.be.eql(0);
 
-            const parentWaitCount = await parentQueue.getJobCountByTypes(
-              'wait',
-            );
+            const parentWaitCount =
+              await parentQueue.getJobCountByTypes('wait');
             expect(parentWaitCount).to.be.eql(1);
             await parentQueue.close();
             await flow.close();

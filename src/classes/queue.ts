@@ -4,6 +4,7 @@ import {
   BulkJobOptions,
   IoredisListener,
   JobSchedulerJson,
+  MinimalQueue,
   QueueOptions,
   RepeatableJob,
   RepeatOptions,
@@ -12,7 +13,6 @@ import {
   FinishedStatus,
   JobsOptions,
   JobSchedulerTemplateOptions,
-  MinimalQueue,
   JobProgress,
 } from '../types';
 import { Job } from './job';
@@ -88,36 +88,30 @@ export interface QueueListener<JobBase extends Job = Job>
   waiting: (job: JobBase) => void;
 }
 
+/**
+ * IsAny<T> A type helper to determine if a given type `T` is `any`.
+ * This works by using `any` type with the intersection
+ * operator (`&`). If `T` is `any`, then `1 & T` resolves to `any`, and since `0`
+ * is assignable to `any`, the conditional type returns `true`.
+ */
+type IsAny<T> = 0 extends 1 & T ? true : false;
 // Helper for JobBase type
-type JobBase<T, ResultType, NameType extends string> = T extends Job<
-  any,
-  any,
-  any
->
-  ? T
-  : Job<T, ResultType, NameType>;
+type JobBase<T, ResultType, NameType extends string> =
+  IsAny<T> extends true
+    ? Job<T, ResultType, NameType>
+    : T extends Job<any, any, any>
+      ? T
+      : Job<T, ResultType, NameType>;
 
 // Helper types to extract DataType, ResultType, and NameType
-type ExtractDataType<DataTypeOrJob, Default> = DataTypeOrJob extends Job<
-  infer D,
-  any,
-  any
->
-  ? D
-  : Default;
+type ExtractDataType<DataTypeOrJob, Default> =
+  DataTypeOrJob extends Job<infer D, any, any> ? D : Default;
 
-type ExtractResultType<DataTypeOrJob, Default> = DataTypeOrJob extends Job<
-  any,
-  infer R,
-  any
->
-  ? R
-  : Default;
+type ExtractResultType<DataTypeOrJob, Default> =
+  DataTypeOrJob extends Job<any, infer R, any> ? R : Default;
 
-type ExtractNameType<
-  DataTypeOrJob,
-  Default extends string,
-> = DataTypeOrJob extends Job<any, any, infer N> ? N : Default;
+type ExtractNameType<DataTypeOrJob, Default extends string> =
+  DataTypeOrJob extends Job<any, any, infer N> ? N : Default;
 
 /**
  * Queue
@@ -295,6 +289,16 @@ export class Queue<
   async setGlobalConcurrency(concurrency: number) {
     const client = await this.client;
     return client.hset(this.keys.meta, 'concurrency', concurrency);
+  }
+
+  /**
+   * Enable and set rate limit.
+   * @param max - Max number of jobs to process in the time period specified in `duration`
+   * @param duration - Time in milliseconds. During this time, a maximum of `max` jobs will be processed.
+   */
+  async setGlobalRateLimit(max: number, duration: number) {
+    const client = await this.client;
+    return client.hset(this.keys.meta, 'max', max, 'duration', duration);
   }
 
   /**
@@ -605,7 +609,9 @@ export class Queue<
    *
    * @param id - identifier of scheduler.
    */
-  async getJobScheduler(id: string): Promise<JobSchedulerJson<DataType>> {
+  async getJobScheduler(
+    id: string,
+  ): Promise<JobSchedulerJson<DataType> | undefined> {
     return (await this.jobScheduler).getScheduler<DataType>(id);
   }
 
@@ -879,6 +885,7 @@ export class Queue<
     type:
       | 'completed'
       | 'wait'
+      | 'waiting'
       | 'active'
       | 'paused'
       | 'prioritized'
@@ -896,14 +903,17 @@ export class Queue<
         let deletedCount = 0;
         const deletedJobsIds: string[] = [];
 
+        // Normalize 'waiting' to 'wait' for consistency with internal Redis keys
+        const normalizedType = type === 'waiting' ? 'wait' : type;
+
         while (deletedCount < maxCount) {
           const jobsIds = await this.scripts.cleanJobsInSet(
-            type,
+            normalizedType,
             timestamp,
             maxCountPerCall,
           );
 
-          this.emit('cleaned', jobsIds, type);
+          this.emit('cleaned', jobsIds, normalizedType);
           deletedCount += jobsIds.length;
           deletedJobsIds.push(...jobsIds);
 
@@ -926,7 +936,7 @@ export class Queue<
 
   /**
    * Completely destroys the queue and all of its contents irreversibly.
-   * This method will the *pause* the queue and requires that there are no
+   * This method will *pause* the queue and requires that there are no
    * active jobs. It is possible to bypass this requirement, i.e. not
    * having active jobs using the "force" option.
    *

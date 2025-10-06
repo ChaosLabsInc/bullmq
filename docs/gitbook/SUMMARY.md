@@ -17,6 +17,7 @@
   * [Auto-removal of jobs](guide/queues/auto-removal-of-jobs.md)
   * [Adding jobs in bulk](guide/queues/adding-bulks.md)
   * [Global Concurrency](guide/queues/global-concurrency.md)
+  * [Global Rate Limit](guide/queues/global-rate-limit.md)
   * [Removing Jobs](guide/queues/removing-jobs.md)
 * [Workers](guide/workers/README.md)
   * [Auto-removal of jobs](guide/workers/auto-removal-of-jobs.md)
@@ -72,12 +73,14 @@
   * [Producers](guide/nestjs/producers.md)
   * [Queue Events Listeners](guide/nestjs/queue-events-listeners.md)
 * [Going to production](guide/going-to-production.md)
-* [Migration to newer versions](guide/migration-to-newer-versions.md)
+* [Migrations](guide/migrations/migration-to-newer-versions.md)
+  * [Bull to BullMQ](guide/migrations/bull-to-bullmq.md)
 * [Troubleshooting](guide/troubleshooting.md)
 
 ## Patterns
 
 * [Adding jobs in bulk across different queues](patterns/adding-bulks.md)
+* [Deduplication](patterns/deduplication.md)
 * [Manually processing jobs](patterns/manually-fetching-jobs.md)
 * [Named Processor](patterns/named-processor.md)
 * [Flows](patterns/flows.md)
@@ -115,7 +118,13 @@
   * [API Reference](https://nestjs.bullmq.pro/)
   * [Changelog](bullmq-pro/nestjs/changelog.md)
 * [API Reference](https://api.bullmq.pro)
-* [Changelog](bullmq-pro/changelog.md)
+* [Changelogs](bullmq-pro/changelog.md)
+  * [v6](bullmq-pro/changelogs/changelog-v6.md)
+  * [v5](bullmq-pro/changelogs/changelog-v5.md)
+  * [v4](bullmq-pro/changelogs/changelog-v4.md)
+  * [v3](bullmq-pro/changelogs/changelog-v3.md)
+  * [v2](bullmq-pro/changelogs/changelog-v2.md)
+  * [v1](bullmq-pro/changelogs/changelog-v1.md)
 * [New Releases](bullmq-pro/new-releases.md)
 * [Support](bullmq-pro/support.md)
 
@@ -139,4 +148,6 @@
 ## Python
 
 * [Introduction](python/introduction.md)
-* [Changelog](python/changelog.md)
+* [Changelogs](python/changelog.md)
+  * [v1](python/changelogs/changelog-v1.md)
+  * [v0](python/changelogs/changelog-v0.md)

@@ -1,4 +1,3 @@
-import { Job } from '../classes/job';
 import { AdvancedOptions } from './advanced-options';
 import { QueueBaseOptions } from './queue-options';
 import { RateLimiterOptions } from './rate-limiter-options';
@@ -6,14 +5,6 @@ import { MetricsOptions } from './metrics-options';
 import { KeepJobs } from './keep-jobs';
 import { Telemetry } from './telemetry';
 import { SandboxedOptions } from './sandboxed-options';
-
-/**
- * An async function that receives `Job`s and handles them.
- */
-export type Processor<T = any, R = any, N extends string = string> = (
-  job: Job<T, R, N>,
-  token?: string,
-) => Promise<R>;
 
 export interface WorkerOptions extends QueueBaseOptions, SandboxedOptions {
   /**
@@ -50,6 +41,15 @@ export interface WorkerOptions extends QueueBaseOptions, SandboxedOptions {
    * @see {@link https://docs.bullmq.io/guide/metrics}
    */
   metrics?: MetricsOptions;
+
+  /**
+   * Defines the maximum number of times a job is allowed to start processing,
+   * regardless of whether it completes or fails. Each time a worker picks up the job
+   * and begins processing it, the attemptsStarted counter is incremented.
+   * If this counter reaches maxStartedAttempts, the job will be moved to the failed state with an UnrecoverableError.
+   * @defaultValue undefined
+   */
+  maxStartedAttempts?: number;
 
   /**
    * Amount of times a job can be recovered from a stalled state

@@ -11,12 +11,13 @@ import {
   GetNextJobOptions,
   IoredisListener,
   JobJsonRaw,
-  Processor,
+  MinimalQueue,
   RedisClient,
   Span,
   WorkerOptions,
 } from '../interfaces';
-import { JobProgress, MinimalQueue } from '../types';
+import { JobProgress } from '../types';
+import { Processor } from '../types/processor';
 import {
   delay,
   DELAY_TIME_1,
@@ -40,6 +41,8 @@ import {
 } from './errors';
 import { SpanKind, TelemetryAttributes } from '../enums';
 import { JobScheduler } from './job-scheduler';
+
+const ONE_SECOND = 1000;
 
 // 10 seconds is the maximum time a BZPOPMIN can block.
 const maximumBlockTimeout = 10;
@@ -232,6 +235,13 @@ export class Worker<
     }
 
     if (
+      typeof this.opts.maxStartedAttempts === 'number' &&
+      this.opts.maxStartedAttempts < 0
+    ) {
+      throw new Error('maxStartedAttempts must be greater or equal than 0');
+    }
+
+    if (
       typeof this.opts.stalledInterval !== 'number' ||
       this.opts.stalledInterval <= 0
     ) {
@@ -262,7 +272,7 @@ export class Worker<
           }
           processor = processor.href;
         } else {
-          const supportedFileTypes = ['.js', '.ts', '.flow', '.cjs'];
+          const supportedFileTypes = ['.js', '.ts', '.flow', '.cjs', '.mjs'];
           const processorFile =
             processor +
             (supportedFileTypes.includes(path.extname(processor)) ? '' : '.js');
@@ -491,9 +501,7 @@ export class Worker<
 
     let tokenPostfix = 0;
 
-    while (!this.closing && !this.paused) {
-      let numTotal = asyncFifoQueue.numTotal();
-
+    while ((!this.closing && !this.paused) || asyncFifoQueue.numTotal() > 0) {
       /**
        * This inner loop tries to fetch jobs concurrently, but if we are waiting for a job
        * to arrive at the queue we should not try to fetch more jobs (as it would be pointless)
@@ -502,7 +510,7 @@ export class Worker<
         !this.closing &&
         !this.paused &&
         !this.waiting &&
-        numTotal < this._concurrency &&
+        asyncFifoQueue.numTotal() < this._concurrency &&
         !this.isRateLimited()
       ) {
         const token = `${this.id}:${tokenPostfix++}`;
@@ -517,9 +525,7 @@ export class Worker<
         );
         asyncFifoQueue.add(fetchedJob);
 
-        numTotal = asyncFifoQueue.numTotal();
-
-        if (this.waiting && numTotal > 1) {
+        if (this.waiting && asyncFifoQueue.numTotal() > 1) {
           // We are waiting for jobs but we have others that we could start processing already
           break;
         }
@@ -529,7 +535,7 @@ export class Worker<
         const job = await fetchedJob;
 
         // No more jobs waiting but we have others that could start processing already
-        if (!job && numTotal > 1) {
+        if (!job && asyncFifoQueue.numTotal() > 1) {
           break;
         }
 
@@ -561,12 +567,10 @@ export class Worker<
             this.opts.runRetryDelay,
           ),
         );
-      } else if (this.isRateLimited()) {
+      } else if (asyncFifoQueue.numQueued() === 0) {
         await this.waitForRateLimit();
       }
     }
-
-    return asyncFifoQueue.waitAll();
   }
 
   /**
@@ -635,8 +639,9 @@ export class Worker<
         this.waiting = null;
       }
     } else {
-      await this.waitForRateLimit();
-      return this.moveToActive(client, token, this.opts.name);
+      if (!this.isRateLimited()) {
+        return this.moveToActive(client, token, this.opts.name);
+      }
     }
   }
 
@@ -714,9 +719,12 @@ will never work with more accuracy than 1ms. */
           // We cannot trust that the blocking connection stays blocking forever
           // due to issues in Redis and IORedis, so we will reconnect if we
           // don't get a response in the expected time.
-          timeout = setTimeout(async () => {
-            bclient.disconnect(!this.closing);
-          }, blockTimeout * 1000 + 1000);
+          timeout = setTimeout(
+            async () => {
+              bclient.disconnect(!this.closing);
+            },
+            blockTimeout * 1000 + 1000,
+          );
 
           this.updateDelays(); // reset delays to avoid reusing same values in next iteration
 
@@ -727,7 +735,13 @@ will never work with more accuracy than 1ms. */
             const [_key, member, score] = result;
 
             if (member) {
-              return parseInt(score);
+              const newBlockUntil = parseInt(score);
+              // Use by pro version as rate limited groups could generate lower blockUntil values
+              // markers only return delays for delayed jobs
+              if (blockUntil && newBlockUntil > blockUntil) {
+                return blockUntil;
+              }
+              return newBlockUntil;
             }
           }
         }
@@ -811,25 +825,68 @@ will never work with more accuracy than 1ms. */
       const job = this.createJob(jobData, jobId);
       job.token = token;
 
-      // Add next scheduled job if necessary.
-      if (job.opts.repeat && !job.nextRepeatableJobId) {
-        // Use new job scheduler if possible
-        if (job.repeatJobKey) {
-          const jobScheduler = await this.jobScheduler;
-          await jobScheduler.upsertJobScheduler(
-            job.repeatJobKey,
-            job.opts.repeat,
-            job.name,
-            job.data,
-            job.opts,
-            { override: false, producerId: job.id },
+      try {
+        await this.retryIfFailed(
+          async () => {
+            if (job.repeatJobKey && job.repeatJobKey.split(':').length < 5) {
+              const jobScheduler = await this.jobScheduler;
+              await jobScheduler.upsertJobScheduler(
+                // Most of these arguments are not really needed
+                // anymore as we read them from the job scheduler itself
+                job.repeatJobKey,
+                job.opts.repeat,
+                job.name,
+                job.data,
+                job.opts,
+                { override: false, producerId: job.id },
+              );
+            } else if (job.opts.repeat) {
+              const repeat = await this.repeat;
+              await repeat.updateRepeatableJob(job.name, job.data, job.opts, {
+                override: false,
+              });
+            }
+          },
+          2.5 * ONE_SECOND, // Wait 2.5 seconds between attempts
+          3, // Retry up to 3 times
+        );
+      } catch (err) {
+        // Emit error but don't throw to avoid breaking current job completion
+        // and leaving the new job in stalled state
+        const errorMessage = err instanceof Error ? err.message : String(err);
+        const schedulingError = new Error(
+          `Failed to add repeatable job for next iteration: ${errorMessage}`,
+        );
+        this.emit('error', schedulingError);
+
+        // Try to move the job to delayed with backoff to prevent infinite retry loops
+        try {
+          // Calculate backoff delay: base delay of 5 seconds, exponentially increasing with attempts
+          const baseDelay = ONE_SECOND; // 1 second
+          const maxDelay = 300 * ONE_SECOND; // 5 minutes max
+          const attempt = job.attemptsStarted;
+          const exponentialDelay = Math.min(
+            baseDelay * Math.pow(2, attempt),
+            maxDelay,
           );
-        } else {
-          const repeat = await this.repeat;
-          await repeat.updateRepeatableJob(job.name, job.data, job.opts, {
-            override: false,
-          });
+
+          await job.moveToDelayed(Date.now() + exponentialDelay, job.token);
+        } catch (moveErr) {
+          // If we can't move it to delayed, emit error and let it become stalled
+          // Stalled jobs will be automatically retried by the stalled checker
+          const moveErrorMessage =
+            moveErr instanceof Error ? moveErr.message : String(moveErr);
+          this.emit(
+            'error',
+            new Error(
+              `Failed to move job ${job.id} to delayed after scheduling error: ${moveErrorMessage}. 
+              Job will become stalled and be retried automatically.`,
+            ),
+          );
         }
+
+        // Return undefined to indicate no next job is available
+        return undefined;
       }
       return job;
     }
@@ -852,6 +909,8 @@ will never work with more accuracy than 1ms. */
           [TelemetryAttributes.WorkerId]: this.id,
           [TelemetryAttributes.WorkerName]: this.opts.name,
           [TelemetryAttributes.JobId]: job.id,
+          [TelemetryAttributes.JobName]: job.name,
+          [TelemetryAttributes.JobAttemptsMade]: job.attemptsMade,
         });
 
         this.emit('active', job, 'waiting');
@@ -860,9 +919,11 @@ will never work with more accuracy than 1ms. */
         const inProgressItem = { job, ts: processedOn };
 
         try {
-          if (job.deferredFailure) {
+          const unrecoverableErrorMessage =
+            this.getUnrecoverableErrorMessage(job);
+          if (unrecoverableErrorMessage) {
             const failed = await this.handleFailed(
-              new UnrecoverableError(job.deferredFailure),
+              new UnrecoverableError(unrecoverableErrorMessage),
               job,
               token,
               fetchNextCallback,
@@ -904,6 +965,20 @@ will never work with more accuracy than 1ms. */
       },
       srcPropagationMedatada,
     );
+  }
+
+  private getUnrecoverableErrorMessage(
+    job: Job<DataType, ResultType, NameType>,
+  ) {
+    if (job.deferredFailure) {
+      return job.deferredFailure;
+    }
+    if (
+      this.opts.maxStartedAttempts &&
+      this.opts.maxStartedAttempts < job.attemptsStarted
+    ) {
+      return 'job started more than allowable limit';
+    }
   }
 
   protected async handleCompleted(
@@ -984,7 +1059,9 @@ will never work with more accuracy than 1ms. */
           return this.nextJobFromJobData(jobData, jobId, token);
         }
       } catch (err) {
-        this.emit('error', <Error>err);
+        if (isNotConnectionError(err as Error)) {
+          this.emit('error', <Error>err);
+        }
         // It probably means that the job has lost the lock before completion
         // A worker will (or already has) moved the job back
         // to the waiting list (as stalled)
@@ -1011,7 +1088,9 @@ will never work with more accuracy than 1ms. */
 
         if (!this.paused) {
           this.paused = true;
-          await (!doNotWaitActive && this.whenCurrentJobsFinished());
+          if (!doNotWaitActive) {
+            await this.whenCurrentJobsFinished();
+          }
           this.stalledCheckStopper?.();
           this.emit('paused');
         }
@@ -1159,11 +1238,7 @@ will never work with more accuracy than 1ms. */
 
   private async stalledChecker() {
     while (!(this.closing || this.paused)) {
-      try {
-        await this.checkConnectionError(() => this.moveStalledJobsToWait());
-      } catch (err) {
-        this.emit('error', <Error>err);
-      }
+      await this.checkConnectionError(() => this.moveStalledJobsToWait());
 
       await new Promise<void>(resolve => {
         const timeout = setTimeout(resolve, this.opts.stalledInterval);
@@ -1205,7 +1280,9 @@ will never work with more accuracy than 1ms. */
               await this.extendLocks(jobsToExtend);
             }
           } catch (err) {
-            this.emit('error', <Error>err);
+            if (isNotConnectionError(err as Error)) {
+              this.emit('error', <Error>err);
+            }
           }
 
           this.startLockExtenderTimer(jobsInProgress);
@@ -1237,20 +1314,36 @@ will never work with more accuracy than 1ms. */
     reconnect && (await this.blockingConnection.reconnect());
   }
 
-  private async retryIfFailed<T>(fn: () => Promise<T>, delayInMs: number) {
-    const retry = 1;
+  private async retryIfFailed<T>(
+    fn: () => Promise<T>,
+    delayInMs: number,
+    maxRetries = Infinity,
+  ): Promise<T> {
+    let retry = 0;
+
     do {
       try {
         return await fn();
       } catch (err) {
-        this.emit('error', <Error>err);
-        if (delayInMs) {
-          await this.delay(delayInMs);
+        if (isNotConnectionError(err as Error)) {
+          this.emit('error', <Error>err);
+          if (delayInMs) {
+            await this.delay(delayInMs);
+          }
+
+          throw err;
         } else {
-          return;
+          if (delayInMs) {
+            await this.delay(delayInMs);
+          }
+
+          if (retry + 1 >= maxRetries) {
+            // If we've reached max retries, throw the last error
+            throw err;
+          }
         }
       }
-    } while (retry);
+    } while (++retry < maxRetries);
   }
 
   protected async extendLocks(jobs: Job[]) {
@@ -1267,23 +1360,19 @@ will never work with more accuracy than 1ms. */
           ),
         });
 
-        try {
-          const erroredJobIds = await this.scripts.extendLocks(
-            jobs.map(job => job.id),
-            jobs.map(job => job.token),
-            this.opts.lockDuration,
+        const erroredJobIds = await this.scripts.extendLocks(
+          jobs.map(job => job.id),
+          jobs.map(job => job.token),
+          this.opts.lockDuration,
+        );
+
+        for (const jobId of erroredJobIds) {
+          // TODO: Send signal to process function that the job has been lost.
+
+          this.emit(
+            'error',
+            new Error(`could not renew lock for job ${jobId}`),
           );
-
-          for (const jobId of erroredJobIds) {
-            // TODO: Send signal to process function that the job has been lost.
-
-            this.emit(
-              'error',
-              new Error(`could not renew lock for job ${jobId}`),
-            );
-          }
-        } catch (err) {
-          this.emit('error', <Error>err);
         }
       },
     );
